@@ -46,7 +46,7 @@ def create_ocr():
     return RapidOCR(params=params)
 
 
-def create_hand_detector():
+def create_hand_detector(image_mode: bool = False):
     import mediapipe as mp
 
     path = model_directory() / "hand_landmarker.task"
@@ -57,7 +57,9 @@ def create_hand_detector():
             base_options=mp.tasks.BaseOptions(
                 model_asset_path=str(path), delegate=mp.tasks.BaseOptions.Delegate.CPU
             ),
-            running_mode=mp.tasks.vision.RunningMode.VIDEO,
+            running_mode=mp.tasks.vision.RunningMode.IMAGE
+            if image_mode
+            else mp.tasks.vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=0.5,
             min_hand_presence_confidence=0.5,

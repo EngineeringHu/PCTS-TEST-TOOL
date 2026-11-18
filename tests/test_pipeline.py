@@ -6,6 +6,7 @@ from pathlib import Path
 import av
 import cv2
 import numpy as np
+import pytest
 
 from pcts_video_tool.analysis import analyze
 from pcts_video_tool.exporting import export_report
@@ -117,7 +118,7 @@ def test_green_refinement_retains_coarse_candidate_when_event_order_conflicts(
         analysis, "detect_rounds", delayed_first_green(analysis.detect_rounds, conflict=True)
     )
     monkeypatch.setattr(analysis, "create_ocr", lambda: None)
-    monkeypatch.setattr(analysis, "create_hand_detector", lambda: None)
+    monkeypatch.setattr(analysis, "create_hand_detector", lambda **kwargs: None)
     session = Session(
         inspect_video(str(path)),
         rois,
@@ -178,8 +179,9 @@ def test_real_ocr_marker_excludes_intro_and_invalid_tail(generated_video, tmp_pa
     assert len(rows) == 1000 and rows[0]["frame"] == "120" and rows[-1]["frame"] == "1119"
 
 
+@pytest.mark.parametrize("press_mode", ["reference", "sample"])
 def test_calibrated_press_pipeline_works_without_hand_model_and_keeps_post_frames(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, press_mode
 ):
     from zipfile import ZipFile
 
@@ -252,22 +254,36 @@ def test_calibrated_press_pipeline_works_without_hand_model_and_keeps_post_frame
     session.touch_calibration = TouchCalibration(
         65, [100 / 639, 170 / 359, 100 / 639, 250 / 359], [130 / 639, 205 / 359]
     )
+    session.press_mode = press_mode
+    if press_mode == "sample":
+        session.touch_calibration.line = []
     result = analyze(session)
     assert len(result.rounds) == 1
     assert result.rounds[0].press.frame == 60 and result.rounds[0].press.state == "review"
     assert result.rounds[0].blink1.frame == 75
     root = Path(result.diagnostic_dir)
     decisions = json.loads((root / "touch-detection.json").read_text())
-    assert decisions[0]["candidates"][0]["confirmed_at"] == 62
+    if press_mode == "reference":
+        assert decisions[0]["candidates"][0]["confirmed_at"] == 62
+    else:
+        assert decisions[0]["direction"][0] < -0.9
     with (root / "touch-signals.csv").open() as f:
         rows = list(csv.DictReader(f))
-    assert max(int(row["frame"]) for row in rows) == 87
+    assert max(int(row["frame"]) for row in rows) == (87 if press_mode == "reference" else 99)
     assert (
         min(int(row["frame"]) for row in rows) == 45
     )  # Exclude press=25 from the orphan green response.
     bundle = tmp_path / "touch-diagnostics.zip"
     export_diagnostics(result, bundle)
     with ZipFile(bundle) as archive:
+        if press_mode == "sample":
+            assert {
+                "analysis/touch-preview-01.png",
+                "analysis/touch-targets.jsonl",
+                "analysis/touch-signals.csv",
+            }.issubset(archive.namelist())
+            assert "analysis/touch-reference.png" not in archive.namelist()
+            return
         assert {
             "analysis/touch-reference.png",
             "analysis/touch-reference-mask.png",

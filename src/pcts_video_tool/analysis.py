@@ -15,16 +15,15 @@ import cv2
 from . import __version__
 from .detection import FeatureExtractor, TextColorTracker, detect_rounds, refine_green_start
 from .marker import TestWindow, find_test_window
-from .models import Session, check_source, save_session
+from .models import Event, Session, check_source, save_session
+from .motion import locate_motion_press, motion_preview, prepare_motion_tracker
 from .recognition import (
     MAX_READING_RETRIES,
     choose_reading,
     create_hand_detector,
     create_ocr,
-    fingertip,
     read_numbers,
     supplement_reading,
-    touch_candidate,
 )
 from .run_logs import log_directory, logger
 from .touch import ContactTracker, TouchSample, locate_contact
@@ -102,7 +101,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     ocr, hand = None, None
     result.analysis_notes = []
     contact = None
-    if result.touch_calibration is not None:
+    if result.press_mode == "reference":
         contact = ContactTracker(
             read_frame(result.video, result.touch_calibration.frame),
             result.rois["touch"],
@@ -136,7 +135,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
         )
     else:
         result.analysis_notes.append(
-            "尚未设置触摸校准，press使用关键点减速候选；可在顶部设置触摸校准"
+            "press使用自动方向与连续指腹轨迹，无需参考线；运动转折候选仍需复核"
         )
     try:
         ocr = create_ocr()
@@ -279,11 +278,10 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     percentage(45)
     if not result.rounds:
         return result
-    progress("准备原图触摸轮廓与读数…" if contact else "加载手部模型并读取本轮数值…")
-    if contact is None:
-        # A calibrated local tracker does not depend on the optional hand model.
+    progress("准备原图触摸轮廓与读数…" if contact else "寻找每轮指腹，估计接近方向…")
+    if result.press_mode == "auto":
         try:
-            hand = create_hand_detector()
+            hand = create_hand_detector(image_mode=True)
         except (ImportError, FileNotFoundError, RuntimeError, ValueError) as error:
             logger.exception("手部模型初始化失败")
             result.analysis_notes.append(f"手部识别未启用：{error}")
@@ -305,11 +303,44 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             stop = (
                 min(end - 1, item.blink1.frame + max(3, round(detection_fps * 0.05)))
                 if contact
-                else item.blink1.frame
+                else min(end - 1, item.blink1.frame + max(3, round(detection_fps * 0.1)))
             )
             windows.append((previous_end, stop, r))
+    motion_trackers, targets, motion_decisions, patches = {}, {}, {}, {}
+    if not contact:
+        try:
+            with (directory / "touch-targets.jsonl").open("w", encoding="utf-8") as target_log:
+                for index, (start, stop, r) in enumerate(windows):
+                    progress(f"寻找指腹样本：第{r + 1}/{len(result.rounds)}轮")
+                    tracker_for_round, anchor, report = prepare_motion_tracker(
+                        lambda frame: read_frame(result.video, frame),
+                        result.rois["touch"],
+                        start,
+                        stop,
+                        result.rounds[r].blink1.frame,
+                        detection_fps,
+                        detector=hand,
+                        sample=result.touch_calibration if result.press_mode == "sample" else None,
+                        cancelled=cancelled,
+                        progress=lambda frame, number=r: progress(
+                            f"寻找指腹：第{number + 1}轮，原片第{frame}帧"
+                        ),
+                    )
+                    targets[r] = report
+                    target_log.write(
+                        json.dumps({"round": r + 1, **report}, ensure_ascii=False) + "\n"
+                    )
+                    target_log.flush()
+                    if tracker_for_round is not None:
+                        motion_trackers[r] = (tracker_for_round, anchor)
+                        patches[r] = []
+                    else:
+                        result.rounds[r].press = Event(reason=report["reason"])
+                    percentage(45 + 5 * (index + 1) // len(windows))
+        finally:
+            if hand:
+                hand.close()
     readings = [[] for _ in result.rounds]
-    points = [[] for _ in result.rounds]
     touch_samples = [[] for _ in result.rounds]
     touch_decisions = []
     with (
@@ -317,7 +348,19 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
         (directory / "touch-signals.csv").open("w", encoding="utf-8", newline="") as touch_log,
     ):
         touch_writer = csv.DictWriter(
-            touch_log, fieldnames=["round", "method", *TouchSample.__dataclass_fields__]
+            touch_log,
+            fieldnames=[
+                "round",
+                "method",
+                *TouchSample.__dataclass_fields__,
+                "flow_points",
+                "overlap",
+                "reason",
+                "flow_x",
+                "flow_y",
+                "position_px",
+                "front_clipped",
+            ],
         )
         touch_writer.writeheader()
 
@@ -341,75 +384,70 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             )
             reading_log.flush()
 
-        try:
-            with av.open(result.video.path) as container:
-                container.streams.video[0].thread_type = "AUTO"
-                previous_ms = -1
-                for i, frame in enumerate(container.decode(video=0)):
-                    if cancelled():
-                        raise InterruptedError("已取消")
-                    if i > window.end:
-                        break
-                    if i < window.start:
-                        continue
-                    if i % 60 == 0:
-                        percentage(
-                            45 + 30 * (i - window.start + 1) // (window.end - window.start + 1)
-                        )
-                        progress(
-                            f"读取数字与分析触摸动作：{i - window.start + 1}/{window.end - window.start + 1}帧"
-                        )
-                    active = (
-                        [r for start, end, r in windows if start <= i <= end]
-                        if (hand or contact)
-                        else []
+        with av.open(result.video.path) as container:
+            container.streams.video[0].thread_type = "AUTO"
+            for i, frame in enumerate(container.decode(video=0)):
+                if cancelled():
+                    raise InterruptedError("已取消")
+                if i > window.end:
+                    break
+                if i < window.start:
+                    continue
+                if i % 60 == 0:
+                    percentage(50 + 25 * (i - window.start + 1) // (window.end - window.start + 1))
+                    progress(
+                        f"读取数字与分析触摸动作：{i - window.start + 1}/{window.end - window.start + 1}帧"
                     )
-                    if not active and (not ocr or i not in ocr_at):
-                        continue
-                    image = display_image(frame)
-                    if ocr and i in ocr_at:
-                        reading = read_numbers(ocr, crop(image, result.rois["reading"]))
-                        for r in ocr_at[i]:
-                            readings[r].append((i, *reading))
-                            record_reading(r, i, "seed", reading)
-                    if active and contact:
-                        if any(i == start for start, _, _ in windows):
-                            contact.previous_center = contact.reference_center.copy()
-                        sample = contact.measure(i, image)
-                        for r in active:
-                            touch_samples[r].append(sample)
-                            touch_writer.writerow(
-                                {"round": r + 1, "method": "calibrated_contour", **asdict(sample)}
-                            )
-                    elif active:
-                        # Tracking's monotonic clock never replaces measurement timestamps.
-                        t = result.video.times[i]
-                        ms = max(
-                            previous_ms + 1, round((t if t is not None else i / result.fps) * 1000)
+                active = [
+                    r
+                    for start, end, r in windows
+                    if start <= i <= end and (contact or r in motion_trackers)
+                ]
+                if not active and (not ocr or i not in ocr_at):
+                    continue
+                image = display_image(frame)
+                if ocr and i in ocr_at:
+                    reading = read_numbers(ocr, crop(image, result.rois["reading"]))
+                    for r in ocr_at[i]:
+                        readings[r].append((i, *reading))
+                        record_reading(r, i, "seed", reading)
+                if active and contact:
+                    if any(i == start for start, _, _ in windows):
+                        contact.previous_center = contact.reference_center.copy()
+                    sample = contact.measure(i, image)
+                    for r in active:
+                        touch_samples[r].append(sample)
+                        touch_writer.writerow(
+                            {"round": r + 1, "method": "calibrated_contour", **asdict(sample)}
                         )
-                        previous_ms = ms
-                        point = fingertip(hand, image, ms, result.rois["touch"])
-                        if point:
-                            for r in active:
-                                points[r].append((i, *point))
-                        sample = (
-                            TouchSample(
-                                i,
-                                x=point[0] * (result.video.width - 1),
-                                y=point[1] * (result.video.height - 1),
+                elif active:
+                    for r in active:
+                        finger, anchor = motion_trackers[r]
+                        patches[r].append((i, image[finger.bounds].copy()))
+                        stop = next(end for _, end, number in windows if number == r)
+                        if i == stop:
+                            progress(f"判断指腹运动转折：第{r + 1}/{len(result.rounds)}轮")
+                            observations = finger.trace(patches.pop(r), anchor, cancelled)
+                            event, decision, rows = locate_motion_press(
+                                observations,
+                                detection_fps,
+                                result.rounds[r].blink1.frame,
+                                finger.origin,
+                                finger.mask,
                             )
-                            if point
-                            else TouchSample(i)
-                        )
-                        for r in active:
-                            touch_writer.writerow(
-                                {"round": r + 1, "method": "hand_landmark", **asdict(sample)}
-                            )
-                    if active and i % 60 == 0:
-                        touch_log.flush()
-        finally:
-            if hand:
-                hand.close()
+                            result.rounds[r].press = event
+                            motion_decisions[r] = decision
+                            for row in rows:
+                                touch_writer.writerow(
+                                    {"round": r + 1, "method": "automatic_finger_motion", **row}
+                                )
+                            ok, encoded = cv2.imencode(".png", motion_preview(finger, decision))
+                            if ok:
+                                (directory / f"touch-preview-{r + 1:02d}.png").write_bytes(
+                                    encoded.tobytes()
+                                )
+                if active and i % 60 == 0:
+                    touch_log.flush()
         percentage(75)
         neighbor_step = max(1, round(sampling_fps(result.video) / 24))
         for r, item in enumerate(result.rounds):
@@ -451,9 +489,16 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                     touch_samples[r], detection_fps, item.blink1.frame
                 )
             else:
-                item.press = touch_candidate(points[r])
-                decision = {"method": "hand_landmark_deceleration", "sample_count": len(points[r])}
-            touch_decisions.append({"round": r + 1, "event": asdict(item.press), **decision})
+                decision = {**motion_decisions.get(r, {}), "target": targets.get(r, {})}
+            touch_decisions.append(
+                {
+                    "round": r + 1,
+                    "mode": result.press_mode,
+                    "blink1": item.blink1.frame,
+                    "event": asdict(item.press),
+                    **decision,
+                }
+            )
             percentage(75 + 20 * (r + 1) // len(result.rounds))
     (directory / "touch-detection.json").write_text(
         json.dumps(touch_decisions, ensure_ascii=False, indent=2), encoding="utf-8"

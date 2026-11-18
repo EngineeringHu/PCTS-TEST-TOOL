@@ -45,7 +45,7 @@ def export_diagnostics(session: Session | None, path: Path) -> None:
             archive.writestr(
                 "current.session.json",
                 json.dumps(
-                    {"format": 4, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False
+                    {"format": 5, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False
                 ),
             )
             if session.diagnostic_dir:
@@ -67,6 +67,7 @@ def export_diagnostics(session: Session | None, path: Path) -> None:
                     "touch-reference-mask.png",
                     "touch-signals.csv",
                     "touch-detection.json",
+                    "touch-targets.jsonl",
                     "run.log",
                     "error.txt",
                     "status.json",
@@ -74,3 +75,6 @@ def export_diagnostics(session: Session | None, path: Path) -> None:
                     source = directory / name
                     if source.is_file():
                         archive.write(source, "analysis/" + name)
+                for source in directory.glob("touch-preview-*.png"):
+                    if source.stem.removeprefix("touch-preview-").isdigit():
+                        archive.write(source, "analysis/" + source.name)

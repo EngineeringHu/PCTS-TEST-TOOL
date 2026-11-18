@@ -19,10 +19,10 @@ class TouchSample:
     quality: float = 0.0
 
 
-class ContactTracker:
-    """Original-pixel contour relative to a user-confirmed contact reference."""
+class FingerRegion:
+    """Original-pixel appearance sample shared by motion and legacy reference modes."""
 
-    def __init__(self, reference: np.ndarray, roi: list[float], calibration: TouchCalibration):
+    def __init__(self, reference: np.ndarray, roi: list[float], skin_point: list[float]):
         height, width = reference.shape[:2]
         scale = np.array([width - 1, height - 1])
         polygon = np.rint(np.asarray(roi).reshape(4, 2) * scale).astype(np.int32)
@@ -32,13 +32,7 @@ class ContactTracker:
         self.reference = reference[self.bounds].copy()
         self.mask = np.zeros(self.reference.shape[:2], np.uint8)
         cv2.fillConvexPoly(self.mask, polygon - self.origin, 1)
-        self.line = np.asarray(calibration.line).reshape(2, 2) * scale - self.origin
-        self.seed = np.asarray(calibration.skin_point) * scale - self.origin
-        tangent = self.line[1] - self.line[0]
-        self.tangent = tangent / np.linalg.norm(tangent)
-        self.normal = np.array([-self.tangent[1], self.tangent[0]])
-        if (self.seed - self.line[0]) @ self.normal < 0:
-            self.normal *= -1
+        self.seed = np.asarray(skin_point) * scale - self.origin
         lab = cv2.cvtColor(self.reference, cv2.COLOR_BGR2LAB).astype(np.float32)
         sx, sy = np.rint(self.seed).astype(int)
         swatch = lab[max(0, sy - 2) : sy + 3, max(0, sx - 2) : sx + 3].reshape(-1, 3)
@@ -49,14 +43,13 @@ class ContactTracker:
         _, labels, stats, _ = cv2.connectedComponentsWithStats(foreground)
         label = labels[sy, sx]
         if label == 0 or stats[label, cv2.CC_STAT_AREA] < 12:
-            raise ValueError("指腹取样点附近没有稳定轮廓，请换一张清晰接触画面并重新取样")
+            raise ValueError("指腹取样点附近没有稳定轮廓，请换一张指腹清晰的画面并重新取样")
         self.reference_mask = (labels == label).astype(np.uint8)
         self.reference_area = int(stats[label, cv2.CC_STAT_AREA])
         if self.reference_area > np.count_nonzero(self.mask) * 0.85:
             raise ValueError("取样颜色与背景难以区分，请调整触摸区域或指腹取样点")
         yy, xx = np.nonzero(self.reference_mask)
         coords = np.column_stack((xx, yy))
-        self.reference_front = float(np.quantile((coords - self.line[0]) @ self.normal, 0.02))
         self.reference_center = coords.mean(axis=0)
         self.previous_center = self.reference_center.copy()
 
@@ -67,6 +60,25 @@ class ContactTracker:
             & (np.abs(lab[:, :, 0] - self.color[0]) <= 75)
             & (self.mask > 0)
         ).astype(np.uint8)
+
+
+class ContactTracker(FingerRegion):
+    """Legacy position-band mode, retained for explicit reference-line comparisons."""
+
+    def __init__(self, reference: np.ndarray, roi: list[float], calibration: TouchCalibration):
+        super().__init__(reference, roi, calibration.skin_point)
+        height, width = reference.shape[:2]
+        self.line = (
+            np.asarray(calibration.line).reshape(2, 2) * [width - 1, height - 1] - self.origin
+        )
+        tangent = self.line[1] - self.line[0]
+        self.tangent = tangent / np.linalg.norm(tangent)
+        self.normal = np.array([-self.tangent[1], self.tangent[0]])
+        if (self.seed - self.line[0]) @ self.normal < 0:
+            self.normal *= -1
+        yy, xx = np.nonzero(self.reference_mask)
+        coords = np.column_stack((xx, yy))
+        self.reference_front = float(np.quantile((coords - self.line[0]) @ self.normal, 0.02))
 
     def measure(self, frame: int, image: np.ndarray) -> TouchSample:
         lab = cv2.cvtColor(image[self.bounds], cv2.COLOR_BGR2LAB).astype(np.float32)

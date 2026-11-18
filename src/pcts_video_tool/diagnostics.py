@@ -20,6 +20,7 @@ def self_test(output: str) -> int:
         from .analysis import analyze
         from .detection import TextColorTracker, refine_green_start
         from .models import Event, Round, Session, TouchCalibration
+        from .motion import MotionTracker, automatic_finger_samples, locate_motion_press
         from .recognition import create_hand_detector, create_ocr, fingertip, read_numbers
         from .run_logs import export_diagnostics
         from .touch import ContactTracker, locate_contact
@@ -34,6 +35,12 @@ def self_test(output: str) -> int:
         with create_hand_detector() as hand:
             fingertip(hand, np.full((360, 640, 3), 255, np.uint8), 0, [0, 0, 1, 0, 1, 1, 0, 1])
         report["checks"].append("手部模型：CPU推理可运行")
+        with create_hand_detector(image_mode=True) as hand:
+            if automatic_finger_samples(
+                hand, np.full((360, 640, 3), 255, np.uint8), [0, 0, 1, 0, 1, 1, 0, 1]
+            ):
+                raise ValueError("自动指腹自检错误：空白画面生成取样")
+        report["checks"].append("自动取样：IMAGE手部模型可运行，空白画面不生成指腹")
         contact_image = np.full((100, 100, 3), 240, np.uint8)
         contact_image[35:65, 40:80] = (100, 150, 200)
         calibration = TouchCalibration(2, [0.4, 0.2, 0.4, 0.8], [0.6, 0.5])
@@ -47,6 +54,16 @@ def self_test(output: str) -> int:
         if event.frame != 2 or event.state != "review":
             raise ValueError("触摸校准首帧回溯自检失败")
         report["checks"].append("触摸：原图轮廓、参考位置与首帧回溯可用，候选需复核")
+        motion_images = []
+        for i, gap in enumerate([12, 6] + [0] * 8):
+            picture = np.full_like(contact_image, 240)
+            picture[35:65, 40 + gap : 80 + gap] = (100, 150, 200)
+            motion_images.append((i, picture))
+        finger = MotionTracker(contact_image, [0, 0, 1, 0, 1, 1, 0, 1], [0.6, 0.5])
+        event, _, _ = locate_motion_press(finger.trace(motion_images, 4), 240, 2, finger.origin)
+        if event.frame != 2 or event.state != "review":
+            raise ValueError("自动方向的运动转折自检失败")
+        report["checks"].append("自动触摸：无参考线、双向追踪、后帧确认并回溯到运动转折")
         black_text = np.full((120, 360, 3), 230, np.uint8)
         green_text = black_text.copy()
         for picture, color in ((black_text, (0, 0, 0)), (green_text, (0, 180, 0))):

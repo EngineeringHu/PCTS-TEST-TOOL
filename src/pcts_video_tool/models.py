@@ -90,6 +90,7 @@ class Session:
     test_end: int | None = None
     range_confirmed: bool = False
     touch_calibration: TouchCalibration | None = None
+    press_mode: str = "auto"
 
     def problems(self) -> list[str]:
         result = []
@@ -143,7 +144,7 @@ def calculate(session: Session, item: Round) -> dict[str, float | None]:
 def save_session(session: Session, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps({"format": 4, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps({"format": 5, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -152,7 +153,7 @@ def save_session(session: Session, path: Path) -> None:
 def load_session(path: Path) -> Session:
     """Validate external session data once at the file boundary."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.pop("format", None) not in (1, 2, 3, 4):
+    if data.pop("format", None) not in (1, 2, 3, 4, 5):
         raise ValueError("不支持的任务文件版本")
     video = VideoInfo(**data.pop("video"))
     if not video.times or video.width <= 0 or video.height <= 0:
@@ -190,6 +191,10 @@ def load_session(path: Path) -> Session:
     raw_calibration = data.pop("touch_calibration", None)
     calibration = TouchCalibration(**raw_calibration) if raw_calibration is not None else None
     session = Session(video=video, rounds=rounds, touch_calibration=calibration, **data)
+    if session.press_mode not in ("auto", "sample", "reference"):
+        raise ValueError("未知press识别方式")
+    if session.press_mode != "auto" and calibration is None:
+        raise ValueError("所选press方式需要先设置指腹样本")
     if session.method not in ("frames", "timestamps"):
         raise ValueError("未知计算方式")
     if not math.isfinite(session.fps) or session.fps <= 0:
@@ -211,12 +216,21 @@ def load_session(path: Path) -> Session:
             raise ValueError("未知区域配置")
         session.rois[name] = normalize_roi(roi, video.width, video.height)
     if calibration is not None:
-        validate_touch_calibration(calibration, video, session.rois.get("touch"))
+        validate_touch_calibration(
+            calibration,
+            video,
+            session.rois.get("touch"),
+            require_line=session.press_mode == "reference",
+        )
     return session
 
 
 def validate_touch_calibration(
-    calibration: TouchCalibration, video: VideoInfo, roi: list[float] | None
+    calibration: TouchCalibration,
+    video: VideoInfo,
+    roi: list[float] | None,
+    *,
+    require_line: bool = True,
 ) -> None:
     """UI/file input boundary; measurement code receives validated coordinates."""
     if roi is None:
@@ -224,7 +238,7 @@ def validate_touch_calibration(
     if type(calibration.frame) is not int or not 0 <= calibration.frame < len(video.times):
         raise ValueError("触摸校准帧超出原片范围")
     if (
-        len(calibration.line) != 4
+        len(calibration.line) not in ((4,) if require_line else (0, 4))
         or len(calibration.skin_point) != 2
         or not all(
             isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1
@@ -232,17 +246,18 @@ def validate_touch_calibration(
         )
     ):
         raise ValueError("触摸校准需要画面内的参考线两端和指腹取样点")
-    x1, y1, x2, y2 = calibration.line
-    dx, dy = (x2 - x1) * (video.width - 1), (y2 - y1) * (video.height - 1)
-    length = math.hypot(dx, dy)
-    if length < 6:
-        raise ValueError("接触参考线太短，请在原图选择至少6像素的线段")
     px, py = calibration.skin_point
-    distance = (
-        abs(dx * (py - y1) * (video.height - 1) - dy * (px - x1) * (video.width - 1)) / length
-    )
-    if distance < 2:
-        raise ValueError("取样点应在指腹内部，不能位于参考线上")
+    if require_line:
+        x1, y1, x2, y2 = calibration.line
+        dx, dy = (x2 - x1) * (video.width - 1), (y2 - y1) * (video.height - 1)
+        length = math.hypot(dx, dy)
+        if length < 6:
+            raise ValueError("接触参考线太短，请在原图选择至少6像素的线段")
+        distance = (
+            abs(dx * (py - y1) * (video.height - 1) - dy * (px - x1) * (video.width - 1)) / length
+        )
+        if distance < 2:
+            raise ValueError("取样点应在指腹内部，不能位于参考线上")
     points = list(zip(roi[::2], roi[1::2]))
     sides = [
         (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])

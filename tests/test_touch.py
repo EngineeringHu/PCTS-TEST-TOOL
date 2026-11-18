@@ -89,7 +89,7 @@ def test_calibration_roundtrip_old_format_and_boundary_validation(session, tmp_p
     save_session(session, path)
     assert load_session(path) == session
     raw = json.loads(path.read_text())
-    assert raw["format"] == 4
+    assert raw["format"] == 5
     raw["format"] = 3
     raw.pop("touch_calibration")
     path.write_text(json.dumps(raw))

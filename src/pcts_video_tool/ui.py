@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from datetime import datetime
 from pathlib import Path
@@ -61,11 +62,17 @@ from .models import (
     save_session,
     validate_touch_calibration,
 )
+from .motion import MotionTracker, motion_preview
 from .run_logs import export_diagnostics, log_directory, logger
 from .touch import ContactTracker
 from .video import crop, inspect_video, rate_summary, read_frame
 
 REGIONS = {"flash": "灯光区域", "green": "变绿文字", "reading": "MD / TX", "touch": "触摸观察区域"}
+PRESS_MODES = {
+    "auto": "指腹设置：自动",
+    "sample": "指腹设置：单点",
+    "reference": "指腹设置：参考线",
+}
 COLORS = {"flash": "#f59e0b", "green": "#22c55e", "reading": "#38bdf8", "touch": "#c084fc"}
 REVIEW_REGIONS = {
     "press": "touch",
@@ -334,12 +341,17 @@ class CalibrationCanvas(VideoCanvas):
     def __init__(self):
         super().__init__()
         self.points = []
+        self.max_points = 3
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
             if self.points:
                 self.points.pop()
-        elif event.button() == Qt.LeftButton and len(self.points) < 3:
+        elif event.button() == Qt.LeftButton and self.max_points:
+            if self.max_points == 1:
+                self.points = []
+            if len(self.points) >= self.max_points:
+                return
             rect = self.image_rect()
             point = event.position()
             if not rect.contains(point.toPoint()):
@@ -367,7 +379,9 @@ class CalibrationCanvas(VideoCanvas):
         for i, point in enumerate(points):
             painter.setPen(QPen(QColor("#4de5ff" if i == 2 else "#ff5c5c"), 2))
             painter.drawEllipse(point, 4, 4)
-            painter.drawText(point + QPointF(6, -6), "指腹取样" if i == 2 else str(i + 1))
+            painter.drawText(
+                point + QPointF(6, -6), "指腹取样" if i == 2 or self.max_points == 1 else str(i + 1)
+            )
 
 
 class MainWindow(QMainWindow):
@@ -400,13 +414,13 @@ class MainWindow(QMainWindow):
             ("导出诊断包", self.export_debug),
             ("检测说明", self.show_analysis_notes),
             ("有效片段", self.configure_range),
-            ("触摸校准", self.configure_touch),
+            ("指腹设置：自动", self.configure_touch),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
             bar.addWidget(button)
             self.buttons.append(button)
-            if label == "触摸校准":
+            if label == "指腹设置：自动":
                 self.calibration_button = button
         layout.addLayout(bar)
         self.metadata = QLabel("本地分析 · 原片逐帧编号 · 预期10轮 · 两种计时方式")
@@ -536,6 +550,9 @@ class MainWindow(QMainWindow):
         reading_row.addWidget(use_reading)
         fields.addRow("读数来源", reading_row)
         rv.addLayout(fields)
+        touch_evidence = QPushButton("查看本轮触摸依据")
+        touch_evidence.clicked.connect(self.show_touch_evidence)
+        rv.addWidget(touch_evidence)
         confirm = QPushButton("应用修改并确认本轮")
         confirm.clicked.connect(self.confirm_round)
         confirm.setStyleSheet("background:#176b87; color:white; padding:9px")
@@ -710,7 +727,7 @@ class MainWindow(QMainWindow):
         self.fps.setEnabled(session.method == "frames")
         self.dirty = True
         self.roi_status.setText(f"区域 {len(session.rois)} / 4")
-        self.calibration_button.setText("触摸已校准" if session.touch_calibration else "触摸校准")
+        self.calibration_button.setText(PRESS_MODES[session.press_mode])
         self.refresh_table()
         self.show_frame(0)
         self.details.setPlainText("\n".join(session.analysis_notes + session.video.warnings))
@@ -844,7 +861,8 @@ class MainWindow(QMainWindow):
             self.session.rois[name] = roi
             if name == "touch":
                 self.session.touch_calibration = None
-                self.calibration_button.setText("触摸校准")
+                self.session.press_mode = "auto"
+                self.calibration_button.setText(PRESS_MODES["auto"])
             self.session.rounds = []
             self.session.analysis_notes = []
             if self.session.range_mode == "auto":
@@ -1132,26 +1150,27 @@ class MainWindow(QMainWindow):
             return
         if "touch" not in self.session.rois:
             QMessageBox.information(
-                self, "触摸校准", "请先框选包含指腹接近和接触位置的触摸观察区域"
+                self, "指腹设置", "请先框选包含指腹接近和接触位置的触摸观察区域"
             )
             return
         self.return_full_view()
         session = self.session
         roi = session.rois["touch"]
         width, height = session.video.width, session.video.height
-        x0 = math.floor(min(roi[::2]) * (width - 1))
-        y0 = math.floor(min(roi[1::2]) * (height - 1))
-        x1 = math.ceil(max(roi[::2]) * (width - 1)) + 1
-        y1 = math.ceil(max(roi[1::2]) * (height - 1)) + 1
+        # Use the tracker's original-pixel bounds; no perspective warp for finger geometry.
+        x0, y0 = round(min(roi[::2]) * (width - 1)), round(min(roi[1::2]) * (height - 1))
+        x1, y1 = round(max(roi[::2]) * (width - 1)) + 1, round(max(roi[1::2]) * (height - 1)) + 1
         dialog = QDialog(self)
-        dialog.setWindowTitle("触摸校准 · 接触参考线与指腹取样")
-        dialog.resize(650, 600)
+        dialog.setWindowTitle("指腹设置 · 自动方向 / 单点取样 / 参考线")
+        dialog.resize(680, 660)
         layout = QVBoxLayout(dialog)
-        instructions = QLabel(
-            "选择一帧明确已接触的画面（不必是首次接触帧）。\n"
-            "依次点击：接触参考线两端 → 指腹内部。参考线应穿过实际落点；不要使用远处屏幕边框。\n"
-            "该线用于图像位置比较；看不清真实间隙时，结果仍需复核。右键撤销上一点。"
-        )
+        mode = QComboBox()
+        mode.addItem("自动：寻找指腹并估计接近方向（推荐）", "auto")
+        mode.addItem("单点取样：点一下指腹，自动估计方向", "sample")
+        mode.addItem("参考线：沿用旧版位置校准", "reference")
+        mode.setCurrentIndex(mode.findData(session.press_mode))
+        layout.addWidget(mode)
+        instructions = QLabel()
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
         frame = QSpinBox()
@@ -1159,36 +1178,77 @@ class MainWindow(QMainWindow):
         frame.setRange(0, len(session.video.times) - 1)
         frame.setKeyboardTracking(False)
         frame.setValue(
-            session.touch_calibration.frame if session.touch_calibration else self.current_frame
+            session.touch_calibration.frame
+            if session.touch_calibration
+            else max(0, self.current_frame)
         )
         layout.addWidget(frame)
         canvas = CalibrationCanvas()
         canvas.setMinimumSize(540, 360)
         layout.addWidget(canvas, 1)
         hint = QLabel()
+        hint.setWordWrap(True)
         layout.addWidget(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("保存校准")
+        buttons.button(QDialogButtonBox.Ok).setText("保存设置")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
         reset = buttons.addButton("重新点选", QDialogButtonBox.ResetRole)
-        clear = buttons.addButton("清除已有校准", QDialogButtonBox.DestructiveRole)
+        clear = buttons.addButton("清除取样并恢复自动", QDialogButtonBox.DestructiveRole)
         clear.setEnabled(session.touch_calibration is not None)
         layout.addWidget(buttons)
         reference = None
+        proposed = None
         selected = session.touch_calibration
+        selected_mode = session.press_mode
 
-        def refresh_hint():
+        def refresh_preview():
+            nonlocal proposed
+            proposed = None
+            save_button = buttons.button(QDialogButtonBox.Ok)
+            save_button.setEnabled(mode.currentData() == "auto")
+            if reference is None:
+                return
+            canvas.set_image(reference[y0:y1, x0:x1])
+            if mode.currentData() == "auto":
+                hint.setText(
+                    "无需点选或画线。分析后点击“查看本轮触摸依据”，检查绿色指腹区域和橙色接近方向。"
+                )
+                return
+            expected = 1 if mode.currentData() == "sample" else 3
+            if len(canvas.points) != expected:
+                hint.setText(
+                    "点击清晰的指腹内部，避开边缘、反光与背景。"
+                    if expected == 1
+                    else ("点击参考线第一个端点", "点击参考线第二个端点", "点击指腹内部取样点")[
+                        len(canvas.points)
+                    ]
+                )
+                return
+            points = [
+                [(x0 + x * (x1 - x0 - 1)) / (width - 1), (y0 + y * (y1 - y0 - 1)) / (height - 1)]
+                for x, y in canvas.points
+            ]
+            candidate = TouchCalibration(
+                frame.value(), [] if expected == 1 else points[0] + points[1], points[-1]
+            )
+            try:
+                validate_touch_calibration(
+                    candidate, session.video, roi, require_line=expected == 3
+                )
+                finger = (
+                    MotionTracker(reference, roi, candidate.skin_point)
+                    if expected == 1
+                    else ContactTracker(reference, roi, candidate)
+                )
+            except ValueError as error:
+                hint.setText(str(error))
+                return
+            canvas.set_image(motion_preview(finger, {}))
+            proposed = candidate
             hint.setText(
-                (
-                    "点击参考线第一个端点",
-                    "点击参考线第二个端点",
-                    "点击指腹内部取样点",
-                    "三点已设置，可保存；更改后需重新分析press",
-                )[len(canvas.points)]
+                "绿色覆盖应只包含指腹；若覆盖背景，请换帧或换取样点。方向会在分析每轮轨迹后显示。"
             )
-            buttons.button(QDialogButtonBox.Ok).setEnabled(
-                len(canvas.points) == 3 and reference is not None
-            )
+            save_button.setEnabled(True)
 
         def load_reference():
             nonlocal reference
@@ -1197,66 +1257,129 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as error:
                 reference = None
                 QMessageBox.warning(dialog, "无法读取参考帧", str(error))
-            else:
-                canvas.set_image(reference[y0:y1, x0:x1])
-            refresh_hint()
+            refresh_preview()
+
+        def change_mode():
+            value = mode.currentData()
+            canvas.max_points = {"auto": 0, "sample": 1, "reference": 3}[value]
+            canvas.points = []
+            frame.setEnabled(value != "auto")
+            reset.setEnabled(value != "auto")
+            instructions.setText(
+                {
+                    "auto": "默认方式：每轮自动寻找指腹，追踪接近、减速和局部展宽。观察区应包含接近过程。看不清时保留缺失或待复核。",
+                    "sample": "选择一帧指腹清晰可见的画面，再点一下指腹内部。不要求该帧已经接触，也不需要画参考线。右键撤销，左键可重新取样。",
+                    "reference": "旧版方式：选择明确已接触的一帧，依次点接触参考线两端、指腹内部。参考线穿过实际落点并沿接触表面，不用远处屏幕边框。右键撤销。",
+                }[value]
+            )
+            calibration = session.touch_calibration
+            if calibration and value != "auto":
+                points = (
+                    [calibration.skin_point]
+                    if value == "sample"
+                    else list(zip(calibration.line[::2], calibration.line[1::2]))
+                    + [calibration.skin_point]
+                    if calibration.line
+                    else []
+                )
+                canvas.points = [
+                    [
+                        (x * (width - 1) - x0) / (x1 - x0 - 1),
+                        (y * (height - 1) - y0) / (y1 - y0 - 1),
+                    ]
+                    for x, y in points
+                ]
+            refresh_preview()
 
         def save():
-            nonlocal selected
-            points = [
-                [(x0 + x * (x1 - x0 - 1)) / (width - 1), (y0 + y * (y1 - y0 - 1)) / (height - 1)]
-                for x, y in canvas.points
-            ]
-            proposed = TouchCalibration(frame.value(), points[0] + points[1], points[2])
-            try:
-                validate_touch_calibration(proposed, session.video, roi)
-                ContactTracker(reference, roi, proposed)
-            except ValueError as error:
-                QMessageBox.warning(dialog, "校准未保存", str(error))
-                return
-            selected = proposed
+            nonlocal selected, selected_mode
+            selected_mode = mode.currentData()
+            selected = session.touch_calibration if selected_mode == "auto" else proposed
             dialog.accept()
 
         def clear_saved():
-            nonlocal selected
-            selected = None
+            nonlocal selected, selected_mode
+            selected, selected_mode = None, "auto"
             dialog.accept()
 
         def reset_points():
             canvas.points = []
-            canvas.update()
-            refresh_hint()
+            refresh_preview()
 
-        if session.touch_calibration:
-            c = session.touch_calibration
-            points = list(zip(c.line[::2], c.line[1::2])) + [c.skin_point]
-            canvas.points = [
-                [(x * (width - 1) - x0) / (x1 - x0 - 1), (y * (height - 1) - y0) / (y1 - y0 - 1)]
-                for x, y in points
-            ]
-        canvas.points_changed.connect(refresh_hint)
+        canvas.points_changed.connect(refresh_preview)
         frame.valueChanged.connect(load_reference)
+        mode.currentIndexChanged.connect(change_mode)
         buttons.accepted.connect(save)
         buttons.rejected.connect(dialog.reject)
         reset.clicked.connect(reset_points)
         clear.clicked.connect(clear_saved)
         load_reference()
-        if dialog.exec() != QDialog.Accepted or selected == session.touch_calibration:
+        change_mode()
+        if dialog.exec() != QDialog.Accepted or (
+            selected == session.touch_calibration and selected_mode == session.press_mode
+        ):
             return
-        session.touch_calibration = selected
+        session.touch_calibration, session.press_mode = selected, selected_mode
         for item in session.rounds:
             if item.press.state != "manual":
-                item.press = Event(reason="触摸校准已更改，请重新分析")
-        self.calibration_button.setText("触摸已校准" if selected else "触摸校准")
+                item.press = Event(reason="指腹设置已更改，请重新分析")
+        self.calibration_button.setText(PRESS_MODES[selected_mode])
         self.region_combo.setCurrentIndex(0)
         self.dirty = True
         self.refresh_table()
         self.select_round()
-        if selected:
+        if selected and selected_mode != "auto":
             self.show_frame(selected.frame)
-        self.statusBar().showMessage(
-            "触摸校准已保存，请重新分析" if selected else "触摸校准已清除；重新分析将使用关键点候选"
+        self.statusBar().showMessage("指腹设置已保存，请重新分析")
+
+    def show_touch_evidence(self):
+        row = self.table.currentRow()
+        if self.session is None or row < 0:
+            return
+        if not self.session.diagnostic_dir:
+            QMessageBox.information(self, "触摸依据", "尚无本次分析的触摸记录，请先分析视频。")
+            return
+        directory = log_directory() / Path(self.session.diagnostic_dir).name
+        report_path = directory / "touch-detection.json"
+        if not report_path.is_file():
+            QMessageBox.information(self, "触摸依据", "尚无本次分析的触摸记录，请先分析视频。")
+            return
+        reports = json.loads(report_path.read_text(encoding="utf-8"))
+        blink1 = self.session.rounds[row].blink1.frame
+        report = next(
+            (r for r in reports if blink1 is not None and r.get("blink1") == blink1), None
         )
+        if report is None:
+            QMessageBox.information(
+                self, "触摸依据", "本轮没有对应的新版本记录，或轮次已被修改；请重新分析。"
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"第{row + 1}轮 · 自动分析时的触摸依据")
+        dialog.resize(600, 500)
+        layout = QVBoxLayout(dialog)
+        target = report.get("target", {})
+        text = QLabel(
+            f"指腹参考帧：{target.get('reference_frame', '未取样')}\n"
+            "绿色：选中的指腹区域；橙色箭头：本轮估计的接近方向。\n"
+            "此图用于核对目标与方向，不表示这一帧已接触。\n" + report["event"]["reason"]
+        )
+        text.setWordWrap(True)
+        layout.addWidget(text)
+        preview = QLabel()
+        preview.setAlignment(Qt.AlignCenter)
+        path = directory / f"touch-preview-{report['round']:02d}.png"
+        if path.is_file():
+            preview.setPixmap(
+                QPixmap(str(path)).scaled(520, 350, Qt.KeepAspectRatio, Qt.FastTransformation)
+            )
+        else:
+            preview.setText("没有自动轨迹预览；参考线模式可在指腹设置中查看取样。")
+        layout.addWidget(preview, 1)
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.rejected.connect(dialog.reject)
+        layout.addWidget(close)
+        dialog.exec()
 
     def configure_range(self):
         if self.session is None:
