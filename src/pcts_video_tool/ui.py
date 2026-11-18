@@ -1,0 +1,1360 @@
+from __future__ import annotations
+
+import copy
+import math
+from datetime import datetime
+from pathlib import Path
+from time import perf_counter
+
+from PySide6.QtCore import QPointF, QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QShortcut,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import __version__
+from .analysis import analyze
+from .exporting import export_report
+from .models import (
+    EVENTS,
+    Event,
+    Round,
+    Session,
+    TouchCalibration,
+    calculate,
+    check_source,
+    load_session,
+    normalize_roi,
+    save_session,
+    validate_touch_calibration,
+)
+from .run_logs import export_diagnostics, log_directory, logger
+from .touch import ContactTracker
+from .video import crop, inspect_video, rate_summary, read_frame
+
+REGIONS = {"flash": "灯光区域", "green": "变绿文字", "reading": "MD / TX", "touch": "触摸观察区域"}
+COLORS = {"flash": "#f59e0b", "green": "#22c55e", "reading": "#38bdf8", "touch": "#c084fc"}
+REVIEW_REGIONS = {
+    "press": "touch",
+    "blink1": "flash",
+    "blink2": "flash",
+    "green": "green",
+    "reading": "reading",
+}
+
+
+class Worker(QThread):
+    progress = Signal(str)
+    percentage = Signal(int)
+    duration = Signal(float)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, function, parent=None):
+        super().__init__(parent)
+        self.function = function
+
+    def run(self):
+        started = perf_counter()
+        try:
+            result = self.function(
+                self.progress.emit, self.isInterruptionRequested, self.percentage.emit
+            )
+        except InterruptedError:
+            self.duration.emit(perf_counter() - started)
+            self.failed.emit("操作已取消，原有任务保留")
+        except Exception as error:
+            self.duration.emit(perf_counter() - started)
+            # Desktop entry boundary: present unexpected library/IO errors without losing work.
+            logger.exception("后台任务失败")
+            self.failed.emit(f"{type(error).__name__}: {error}")
+        else:
+            self.duration.emit(perf_counter() - started)
+            self.percentage.emit(100)
+            self.completed.emit(result)
+
+
+class VideoCanvas(QWidget):
+    region_changed = Signal(str, list)
+    selection_error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(480, 280)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.pixmap = QPixmap()
+        self.empty_text = "导入原始视频，开始逐帧测量"
+        self.rois = {}
+        self.regions_visible = True
+        self.selection = None
+        self.shape = "quad"
+        self.origin = None
+        self.cursor_point = None
+        self.pending = []
+        self.dragging = None
+        self.preview = None
+
+    def set_image(self, image):
+        rgb = image[:, :, ::-1].copy()
+        qimage = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format_RGB888)
+        self.pixmap = QPixmap.fromImage(qimage.copy())
+        self.update()
+
+    def clear_image(self, message):
+        self.pixmap = QPixmap()
+        self.empty_text = message
+        self.update()
+
+    def image_rect(self):
+        if self.pixmap.isNull():
+            return QRect()
+        size = self.pixmap.size().scaled(self.size(), Qt.KeepAspectRatio)
+        return QRect(
+            (self.width() - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+            size.width(),
+            size.height(),
+        )
+
+    def reset_selection(self):
+        self.origin = self.cursor_point = self.dragging = self.preview = None
+        self.pending = []
+        self.update()
+
+    def set_region(self, name):
+        self.reset_selection()
+        self.selection = name
+
+    def set_shape(self, shape):
+        self.reset_selection()
+        self.shape = shape
+
+    def set_regions_visible(self, visible):
+        self.regions_visible = visible
+        self.reset_selection()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#111d2b"))
+        rect = self.image_rect()
+        if self.pixmap.isNull():
+            painter.setPen(QColor("#bbc8d6"))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
+            return
+        painter.drawPixmap(rect, self.pixmap)
+        if not self.regions_visible:
+            return
+        for name, stored in self.rois.items():
+            roi = self.preview if name == self.selection and self.preview is not None else stored
+            points = [
+                QPointF(rect.x() + x * rect.width(), rect.y() + y * rect.height())
+                for x, y in zip(roi[::2], roi[1::2])
+            ]
+            painter.setPen(QPen(QColor(COLORS[name]), 2))
+            painter.drawPolygon(QPolygonF(points))
+            painter.drawText(points[0] + QPointF(3, -5), REGIONS[name])
+            if name == self.selection:
+                for i, point in enumerate(points, 1):
+                    painter.drawEllipse(point, 5, 5)
+                    painter.drawText(point + QPointF(6, 13), str(i))
+        if self.pending:
+            points = [
+                QPointF(rect.x() + x * rect.width(), rect.y() + y * rect.height())
+                for x, y in self.pending
+            ]
+            painter.setPen(QPen(QColor("white"), 2))
+            painter.drawPolyline(QPolygonF(points))
+            for i, point in enumerate(points, 1):
+                painter.drawEllipse(point, 4, 4)
+                painter.drawText(point + QPointF(5, -6), str(i))
+        if self.origin is not None and self.cursor_point is not None:
+            painter.setPen(QPen(QColor("white"), 2, Qt.DashLine))
+            painter.drawRect(QRect(self.origin, self.cursor_point).normalized())
+
+    def emit_roi(self, values):
+        try:
+            roi = normalize_roi(values, self.pixmap.width(), self.pixmap.height())
+        except ValueError as error:
+            self.selection_error.emit(str(error))
+        else:
+            self.region_changed.emit(self.selection, roi)
+        self.reset_selection()
+
+    def mousePressEvent(self, event):
+        if not self.regions_visible:
+            return
+        if event.button() == Qt.RightButton:
+            if self.pending:
+                self.pending.pop()
+                self.update()
+            else:
+                self.reset_selection()
+            return
+        rect = self.image_rect()
+        if not self.selection or not rect.contains(event.position().toPoint()):
+            return
+        self.setFocus()
+        point = event.position()
+        if self.shape == "rectangle":
+            self.origin = point.toPoint()
+            self.cursor_point = self.origin
+            return
+        roi = self.rois.get(self.selection)
+        if roi and not self.pending:
+            for i, (x, y) in enumerate(zip(roi[::2], roi[1::2])):
+                if (point.x() - rect.x() - x * rect.width()) ** 2 + (
+                    point.y() - rect.y() - y * rect.height()
+                ) ** 2 <= 100:
+                    self.dragging, self.preview = i, list(roi)
+                    return
+        self.pending.append(
+            ((point.x() - rect.x()) / rect.width(), (point.y() - rect.y()) / rect.height())
+        )
+        if len(self.pending) == 4:
+            self.emit_roi([v for point in self.pending for v in point])
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.dragging is not None:
+            rect = self.image_rect()
+            x = max(0.0, min(1.0, (event.position().x() - rect.x()) / rect.width()))
+            y = max(0.0, min(1.0, (event.position().y() - rect.y()) / rect.height()))
+            self.preview[self.dragging * 2 : self.dragging * 2 + 2] = [x, y]
+        elif self.origin is not None:
+            self.cursor_point = event.position().toPoint()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        if self.dragging is not None:
+            self.mouseMoveEvent(event)
+            self.emit_roi(self.preview)
+        elif self.origin is not None:
+            rect = self.image_rect()
+            box = QRect(self.origin, event.position().toPoint()).normalized().intersected(rect)
+            if box.width() >= 6 and box.height() >= 6:
+                self.emit_roi(
+                    [
+                        (box.x() - rect.x()) / rect.width(),
+                        (box.y() - rect.y()) / rect.height(),
+                        box.width() / rect.width(),
+                        box.height() / rect.height(),
+                    ]
+                )
+            else:
+                self.reset_selection()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.reset_selection()
+        else:
+            super().keyPressEvent(event)
+
+
+class FrameComparison(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        self.title = QLabel("三帧对照")
+        self.title.setWordWrap(True)
+        bar.addWidget(self.title, 1)
+        self.crop_only = QCheckBox("仅看选区")
+        self.crop_only.setChecked(True)
+        bar.addWidget(self.crop_only)
+        self.back_button = QPushButton("返回全画面")
+        bar.addWidget(self.back_button)
+        layout.addLayout(bar)
+        columns = QHBoxLayout()
+        self.boxes, self.panes = [], []
+        self.frame_indices = [None, None, None]
+        for i, label in enumerate(("上一帧", "当前帧", "下一帧")):
+            box = QGroupBox(label)
+            if i == 1:
+                box.setStyleSheet(
+                    "QGroupBox { border:2px solid #176b87; } QGroupBox::title { color:#176b87; font-weight:bold; }"
+                )
+            pane = VideoCanvas()
+            pane.setMinimumSize(160, 160)
+            pane.set_regions_visible(False)
+            QVBoxLayout(box).addWidget(pane)
+            columns.addWidget(box, 1)
+            self.boxes.append(box)
+            self.panes.append(pane)
+        layout.addLayout(columns, 1)
+
+    def set_panel(self, position, frame, image, message=""):
+        self.frame_indices[position] = frame
+        label = ("上一帧", "当前帧", "下一帧")[position]
+        self.boxes[position].setTitle(f"{label} · {frame if frame is not None else '无'}")
+        if image is None:
+            self.panes[position].clear_image(message)
+        else:
+            self.panes[position].set_image(image)
+
+
+class CalibrationCanvas(VideoCanvas):
+    points_changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.points = []
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            if self.points:
+                self.points.pop()
+        elif event.button() == Qt.LeftButton and len(self.points) < 3:
+            rect = self.image_rect()
+            point = event.position()
+            if not rect.contains(point.toPoint()):
+                return
+            self.points.append(
+                [
+                    max(0.0, min(1.0, (point.x() - rect.x()) / (rect.width() - 1))),
+                    max(0.0, min(1.0, (point.y() - rect.y()) / (rect.height() - 1))),
+                ]
+            )
+        self.update()
+        self.points_changed.emit()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        rect = self.image_rect()
+        points = [
+            QPointF(rect.x() + x * (rect.width() - 1), rect.y() + y * (rect.height() - 1))
+            for x, y in self.points
+        ]
+        painter.setPen(QPen(QColor("#ff5c5c"), 2))
+        if len(points) >= 2:
+            painter.drawLine(points[0], points[1])
+        for i, point in enumerate(points):
+            painter.setPen(QPen(QColor("#4de5ff" if i == 2 else "#ff5c5c"), 2))
+            painter.drawEllipse(point, 4, 4)
+            painter.drawText(point + QPointF(6, -6), "指腹取样" if i == 2 else str(i + 1))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"PCTS Video Tool {__version__} · 触屏耗时测量")
+        self.resize(1440, 960)
+        self.session = None
+        self.worker = None
+        self.current_frame = -1
+        self.dirty = False
+        self.editing = False
+        self.comparison_field = None
+        self.analysis_started = None
+        self.analysis_elapsed_seconds = 0.0
+        self.root = QWidget()
+        self.setCentralWidget(self.root)
+        layout = QVBoxLayout(self.root)
+        bar = QHBoxLayout()
+        title = QLabel("PCTS  /  VIDEO MEASUREMENT")
+        title.setStyleSheet("font-size:20px; font-weight:700; color:#17324d; padding:8px")
+        bar.addWidget(title)
+        bar.addStretch()
+        self.buttons = []
+        for label, callback in (
+            ("导入视频", self.open_video),
+            ("打开任务", self.open_task),
+            ("保存任务", self.save_task),
+            ("导出 Excel + 证据", self.export),
+            ("导出诊断包", self.export_debug),
+            ("检测说明", self.show_analysis_notes),
+            ("有效片段", self.configure_range),
+            ("触摸校准", self.configure_touch),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            bar.addWidget(button)
+            self.buttons.append(button)
+            if label == "触摸校准":
+                self.calibration_button = button
+        layout.addLayout(bar)
+        self.metadata = QLabel("本地分析 · 原片逐帧编号 · 预期10轮 · 两种计时方式")
+        self.metadata.setWordWrap(True)
+        layout.addWidget(self.metadata)
+        split = QSplitter(Qt.Horizontal)
+        left, right = QWidget(), QWidget()
+        lv, rv = QVBoxLayout(left), QVBoxLayout(right)
+        lv.setContentsMargins(0, 0, 8, 0)
+        rv.setContentsMargins(4, 0, 0, 0)
+        self.canvas = VideoCanvas()
+        self.canvas.region_changed.connect(self.region_changed)
+        self.canvas.selection_error.connect(self.statusBar().showMessage)
+        self.comparison = FrameComparison()
+        self.video_views = QStackedWidget()
+        self.video_views.addWidget(self.canvas)
+        self.video_views.addWidget(self.comparison)
+        self.comparison.back_button.clicked.connect(self.return_full_view)
+        self.comparison.crop_only.toggled.connect(lambda: self.show_frame(self.current_frame))
+        lv.addWidget(self.video_views, 1)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.valueChanged.connect(self.slider_changed)
+        lv.addWidget(self.slider)
+        navigation = QHBoxLayout()
+        for label, delta in (("−10帧", -10), ("上一帧", -1), ("下一帧", 1), ("+10帧", 10)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, d=delta: self.step(d))
+            navigation.addWidget(button)
+        navigation.addWidget(QLabel("原片帧号"))
+        self.frame_input = QSpinBox()
+        self.frame_input.setRange(-1, 0)
+        self.frame_input.setSpecialValueText("未指定")
+        self.frame_input.setValue(-1)
+        self.frame_input.valueChanged.connect(self.show_frame)
+        navigation.addWidget(self.frame_input)
+        self.time_label = QLabel("—")
+        navigation.addWidget(self.time_label)
+        lv.addLayout(navigation)
+        roi_bar = QHBoxLayout()
+        self.region_combo = QComboBox()
+        self.region_combo.addItem("查看画面（不框选）", None)
+        for key, text in REGIONS.items():
+            self.region_combo.addItem("框选：" + text, key)
+        self.region_combo.currentIndexChanged.connect(self.select_region)
+        roi_bar.addWidget(self.region_combo)
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItem("四点框选（侧拍）", "quad")
+        self.shape_combo.addItem("矩形拖选", "rectangle")
+        self.shape_combo.currentIndexChanged.connect(
+            lambda: self.canvas.set_shape(self.shape_combo.currentData())
+        )
+        roi_bar.addWidget(self.shape_combo)
+        self.region_visibility = QCheckBox("显示选区")
+        self.region_visibility.setChecked(True)
+        self.region_visibility.toggled.connect(self.canvas.set_regions_visible)
+        roi_bar.addWidget(self.region_visibility)
+        self.roi_status = QLabel("区域 0 / 4")
+        roi_bar.addWidget(self.roi_status)
+        self.run_button = QPushButton("开始自动分析")
+        self.run_button.setStyleSheet("background:#176b87; color:white; font-weight:600")
+        self.run_button.clicked.connect(self.start_analysis)
+        roi_bar.addWidget(self.run_button)
+        lv.addLayout(roi_bar)
+        hint = QLabel(
+            "四点顺序：左上→右上→右下→左下。可拖角点微调；右键撤销，Esc取消。左右键逐帧。"
+        )
+        hint.setWordWrap(True)
+        lv.addWidget(hint)
+        timing = QGroupBox("耗时计算")
+        tf = QFormLayout(timing)
+        self.method = QComboBox()
+        self.method.addItem("按帧数 / FPS", "frames")
+        self.method.addItem("按视频时间戳", "timestamps")
+        self.fps = QDoubleSpinBox()
+        self.fps.setRange(1, 10000)
+        self.fps.setDecimals(3)
+        self.fps.setValue(240)
+        self.method.currentIndexChanged.connect(self.timing_changed)
+        self.fps.valueChanged.connect(self.timing_changed)
+        tf.addRow("计算方式", self.method)
+        tf.addRow("FPS", self.fps)
+        notice = QLabel(
+            "切换后重算全部轮次。时间戳使用文件展示时间轴；变速素材需核对真实采集时间。"
+        )
+        notice.setWordWrap(True)
+        tf.addRow(notice)
+        rv.addWidget(timing)
+        self.round_title = QLabel("选择下方轮次，复核或修正")
+        self.round_title.setStyleSheet("font-weight:700; font-size:16px; padding:6px")
+        rv.addWidget(self.round_title)
+        fields = QFormLayout()
+        self.event_inputs = {}
+        for name in EVENTS:
+            row = QHBoxLayout()
+            spin = QSpinBox()
+            spin.setRange(-1, 0)
+            spin.setValue(-1)
+            spin.setSpecialValueText("未识别")
+            self.event_inputs[name] = spin
+            spin.valueChanged.connect(lambda value, n=name: self.edit_event(n, value))
+            row.addWidget(spin)
+            jump = QPushButton("查看")
+            jump.clicked.connect(lambda checked=False, n=name: self.jump_event(n))
+            row.addWidget(jump)
+            choose = QPushButton("设为当前帧")
+            choose.clicked.connect(lambda checked=False, n=name: self.select_current(n))
+            row.addWidget(choose)
+            fields.addRow(name, row)
+        self.md, self.tx = QLineEdit(), QLineEdit()
+        self.md.setPlaceholderText("毫秒，可留空")
+        self.tx.setPlaceholderText("毫秒，可为负数")
+        self.md.textEdited.connect(lambda text: self.edit_number("md", text))
+        self.tx.textEdited.connect(lambda text: self.edit_number("tx", text))
+        fields.addRow("MD", self.md)
+        fields.addRow("TX", self.tx)
+        self.reading_frame = QSpinBox()
+        self.reading_frame.setRange(-1, 0)
+        self.reading_frame.setSpecialValueText("未指定")
+        self.reading_frame.valueChanged.connect(self.edit_reading_frame)
+        reading_row = QHBoxLayout()
+        reading_row.addWidget(self.reading_frame)
+        show_reading = QPushButton("查看读数帧")
+        show_reading.clicked.connect(lambda: self.review_event("reading"))
+        reading_row.addWidget(show_reading)
+        use_reading = QPushButton("设为当前帧")
+        use_reading.clicked.connect(lambda: self.select_current("reading"))
+        reading_row.addWidget(use_reading)
+        fields.addRow("读数来源", reading_row)
+        rv.addLayout(fields)
+        confirm = QPushButton("应用修改并确认本轮")
+        confirm.clicked.connect(self.confirm_round)
+        confirm.setStyleSheet("background:#176b87; color:white; padding:9px")
+        rv.addWidget(confirm)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        rv.addWidget(self.details, 1)
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([950, 490])
+        layout.addWidget(split, 3)
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(
+            ["轮次", "press", "blink 1", "blink 2", "green", "MD", "TX", "端到端 ms", "复核状态"]
+        )
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self.select_round)
+        self.table.cellClicked.connect(self.review_cell)
+        layout.addWidget(self.table, 2)
+        footer = QHBoxLayout()
+        self.summary = QLabel("尚未导入视频")
+        footer.addWidget(self.summary, 1)
+        add = QPushButton("补充缺失轮次")
+        add.clicked.connect(self.add_round)
+        remove = QPushButton("删除误检轮次")
+        remove.clicked.connect(self.remove_round)
+        footer.addWidget(add)
+        footer.addWidget(remove)
+        layout.addLayout(footer)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("等待任务")
+        self.progress_bar.setMinimumWidth(220)
+        self.progress_bar.setMaximumWidth(300)
+        self.progress_bar.setToolTip("按处理阶段和已完成帧/轮次计算进度，不代表预计剩余时间")
+        self.statusBar().addPermanentWidget(self.progress_bar)
+        self.elapsed_label = QLabel("分析用时：—")
+        self.elapsed_label.setToolTip("保留最近一次分析的用时；重新开始分析时清零")
+        self.statusBar().addPermanentWidget(self.elapsed_label)
+        self.analysis_clock_timer = QTimer(self)
+        self.analysis_clock_timer.setInterval(200)
+        self.analysis_clock_timer.timeout.connect(self.update_analysis_clock)
+        self.cancel_button = QPushButton("取消当前操作")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_work)
+        self.statusBar().addPermanentWidget(self.cancel_button)
+        self.seek_timer = QTimer(self)
+        self.seek_timer.setSingleShot(True)
+        self.seek_timer.timeout.connect(lambda: self.show_frame(self.slider.value()))
+        for key, delta in (("Left", -1), ("Right", 1), ("Shift+Left", -10), ("Shift+Right", 10)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda d=delta: self.shortcut_step(d))
+        self.setStyleSheet("""
+            QMainWindow, QWidget { font-family: 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+                font-size: 12px; color: #1e293b; }
+            QMainWindow { background: #f3f6fa; }
+            QPushButton { padding: 6px 10px; border: 1px solid #cad5df; border-radius: 4px; }
+            QPushButton:hover { border-color: #176b87; }
+            QGroupBox { border: 1px solid #cad5df; border-radius: 5px; margin-top: 12px; padding-top: 12px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 8px; }
+            QTableWidget { background: white; gridline-color: #e2e8f0; }
+            QHeaderView::section { background: #e8eef5; padding: 7px; border: none; font-weight: 600; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { padding: 5px; }
+            QProgressBar { border: 1px solid #cad5df; border-radius: 4px;
+                text-align: center; min-height: 18px; }
+            QProgressBar::chunk { background: #69b6c9; border-radius: 3px; }
+        """)
+
+    def begin(self, function, completed, *, measure_analysis=False):
+        if self.worker and self.worker.isRunning():
+            return
+        self.seek_timer.stop()
+        self.root.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("正在处理")
+        self.worker = Worker(function, self)
+        self.worker.progress.connect(self.statusBar().showMessage)
+        self.worker.percentage.connect(self.show_progress)
+        if measure_analysis:
+            self.analysis_started = perf_counter()
+            self.analysis_elapsed_seconds = 0.0
+            self.update_analysis_clock()
+            self.analysis_clock_timer.start()
+            self.worker.duration.connect(self.finish_analysis_clock)
+        self.worker.completed.connect(completed)
+        self.worker.failed.connect(self.error)
+        self.worker.finished.connect(self.work_finished)
+        self.worker.start()
+
+    def update_analysis_clock(self):
+        elapsed = (
+            perf_counter() - self.analysis_started
+            if self.analysis_started is not None
+            else self.analysis_elapsed_seconds
+        )
+        minutes, seconds = divmod(int(elapsed), 60)
+        hours, minutes = divmod(minutes, 60)
+        self.elapsed_label.setText(f"分析用时：{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def finish_analysis_clock(self, elapsed):
+        self.analysis_clock_timer.stop()
+        self.analysis_started = None
+        self.analysis_elapsed_seconds = elapsed
+        self.update_analysis_clock()
+
+    def show_progress(self, value):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(value)
+        self.progress_bar.setFormat("已完成 · %p%" if value == 100 else "%p%")
+
+    def work_finished(self):
+        self.root.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+
+    def cancel_work(self):
+        if self.worker:
+            self.worker.requestInterruption()
+            self.statusBar().showMessage("正在取消，请等待当前步骤结束…")
+
+    def error(self, message):
+        logger.warning("%s", message)
+        self.statusBar().showMessage(message)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, self.progress_bar.value()))
+        self.progress_bar.setFormat("已取消 · %p%" if "已取消" in message else "未完成 · %p%")
+        if "已取消" not in message:
+            QMessageBox.warning(self, "操作未完成", message)
+
+    def may_replace(self):
+        return (
+            not self.dirty
+            or QMessageBox.question(
+                self, "尚未保存", "当前任务有未保存的改动，继续会放弃这些改动。是否继续？"
+            )
+            == QMessageBox.Yes
+        )
+
+    def open_video(self):
+        if not self.may_replace():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择原始视频", "", "视频 (*.mov *.MOV *.mp4 *.mkv *.avi);;全部文件 (*)"
+        )
+        if path:
+            self.begin(
+                lambda progress, cancel, percentage: Session(inspect_video(path, progress, cancel)),
+                self.accept_session,
+            )
+
+    def accept_session(self, session):
+        self.editing = True
+        self.return_full_view()
+        self.session = session
+        self.canvas.reset_selection()
+        self.canvas.rois = session.rois
+        maximum = len(session.video.times) - 1
+        self.slider.setRange(0, maximum)
+        self.frame_input.setRange(-1, maximum)
+        for spin in (*self.event_inputs.values(), self.reading_frame):
+            spin.setRange(-1, maximum)
+        self.method.blockSignals(True)
+        self.fps.blockSignals(True)
+        self.method.setCurrentIndex(0 if session.method == "frames" else 1)
+        self.fps.setValue(session.fps)
+        self.method.blockSignals(False)
+        self.fps.blockSignals(False)
+        self.fps.setEnabled(session.method == "frames")
+        self.dirty = True
+        self.roi_status.setText(f"区域 {len(session.rois)} / 4")
+        self.calibration_button.setText("触摸已校准" if session.touch_calibration else "触摸校准")
+        self.refresh_table()
+        self.show_frame(0)
+        self.details.setPlainText("\n".join(session.analysis_notes + session.video.warnings))
+        self.editing = False
+        if 0 <= self.table.currentRow() < len(session.rounds):
+            self.select_round()
+        else:
+            self.editing = True
+            for spin in (*self.event_inputs.values(), self.reading_frame):
+                spin.setValue(-1)
+            self.md.clear()
+            self.tx.clear()
+            self.round_title.setText("选择下方轮次，复核或修正")
+            self.editing = False
+        self.statusBar().showMessage("任务已就绪。可框选区域、开始分析，或复核现有结果。")
+
+    def show_frame(self, index):
+        if self.session is None or not -1 <= index < len(self.session.video.times):
+            return
+        self.seek_timer.stop()
+        image = None
+        if index >= 0:
+            try:
+                image = read_frame(self.session.video, index)
+            except (OSError, ValueError) as error:
+                self.show_frame(-1)
+                self.error(str(error))
+                return
+        self.current_frame = index
+        if image is None:
+            self.canvas.clear_image("未指定帧\n请用下方导航定位")
+        else:
+            self.canvas.set_image(image)
+        if self.comparison_field is not None:
+            name = self.comparison_field
+            region = REVIEW_REGIONS[name]
+            roi = self.session.rois.get(region) if self.comparison.crop_only.isChecked() else None
+            label = "MD / TX" if name == "reading" else name.replace("blink", "blink ")
+            mode = REGIONS[region] if roi else "全画面"
+            self.comparison.title.setText(
+                f"第{self.table.currentRow() + 1}轮 · {label} · {mode}"
+                + (" · 尚未指定帧" if index < 0 else " · 浏览不修改表格")
+            )
+            for position, offset in enumerate((-1, 0, 1)):
+                neighbor = index + offset
+                if index < 0 or not 0 <= neighbor < len(self.session.video.times):
+                    message = (
+                        "该字段未指定帧\n可用下方导航查找"
+                        if index < 0
+                        else ("视频起点\n没有上一帧" if offset < 0 else "视频末尾\n没有下一帧")
+                    )
+                    self.comparison.set_panel(position, None, None, message)
+                    continue
+                try:
+                    picture = image if offset == 0 else read_frame(self.session.video, neighbor)
+                except (OSError, ValueError) as error:
+                    logger.warning("对照帧%d读取失败：%s", neighbor, error)
+                    self.comparison.set_panel(position, neighbor, None, "该帧读取失败")
+                    continue
+                if roi:
+                    if region == "touch":
+                        # Preserve the non-planar finger shape instead of rectifying it.
+                        height, width = picture.shape[:2]
+                        x0, x1 = (
+                            math.floor(min(roi[::2]) * (width - 1)),
+                            math.ceil(max(roi[::2]) * (width - 1)) + 1,
+                        )
+                        y0, y1 = (
+                            math.floor(min(roi[1::2]) * (height - 1)),
+                            math.ceil(max(roi[1::2]) * (height - 1)) + 1,
+                        )
+                        picture = picture[y0:y1, x0:x1]
+                    else:
+                        picture = crop(picture, roi)
+                self.comparison.set_panel(position, neighbor, picture)
+        for widget, value in ((self.slider, max(0, index)), (self.frame_input, index)):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        t = self.session.video.times[index] if index >= 0 else None
+        self.time_label.setText(
+            "未指定帧" if index < 0 else ("PTS缺失" if t is None else f"PTS {t:.6f} s")
+        )
+
+    def return_full_view(self):
+        self.comparison_field = None
+        self.video_views.setCurrentWidget(self.canvas)
+        self.region_visibility.setEnabled(True)
+        self.shape_combo.setEnabled(True)
+
+    def review_event(self, name):
+        row = self.table.currentRow()
+        if self.session is None or not 0 <= row < len(self.session.rounds):
+            return
+        self.region_combo.setCurrentIndex(0)
+        self.comparison_field = name
+        self.video_views.setCurrentWidget(self.comparison)
+        self.region_visibility.setEnabled(False)
+        self.shape_combo.setEnabled(False)
+        item = self.session.rounds[row]
+        frame = item.reading_frame if name == "reading" else getattr(item, name).frame
+        self.show_frame(frame if frame is not None else -1)
+
+    def slider_changed(self, value):
+        self.seek_timer.start(100)
+
+    def step(self, delta):
+        if self.session:
+            self.show_frame(
+                0
+                if self.current_frame < 0
+                else max(0, min(len(self.session.video.times) - 1, self.current_frame + delta))
+            )
+
+    def shortcut_step(self, delta):
+        if self.root.isEnabled() and not isinstance(
+            QApplication.focusWidget(), (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
+        ):
+            self.step(delta)
+
+    def region_changed(self, name, roi):
+        if self.session:
+            if (
+                self.session.rounds
+                and QMessageBox.question(
+                    self, "更改分析区域", "更改区域会清空当前轮次结果，是否继续？"
+                )
+                != QMessageBox.Yes
+            ):
+                return
+            self.session.rois[name] = roi
+            if name == "touch":
+                self.session.touch_calibration = None
+                self.calibration_button.setText("触摸校准")
+            self.session.rounds = []
+            self.session.analysis_notes = []
+            if self.session.range_mode == "auto":
+                self.session.test_start = self.session.test_end = None
+                self.session.range_confirmed = False
+            self.dirty = True
+            self.roi_status.setText(f"区域 {len(self.session.rois)} / 4")
+            self.refresh_table()
+            self.statusBar().showMessage("区域已更新；原检测结果已清空，请重新分析")
+
+    def select_region(self):
+        name = self.region_combo.currentData()
+        if name is not None:
+            self.return_full_view()
+            self.region_visibility.setChecked(True)
+        self.canvas.set_region(name)
+
+    def start_analysis(self):
+        if self.session:
+            self.return_full_view()
+            self.region_combo.setCurrentIndex(0)
+            self.region_visibility.setChecked(False)
+            snapshot = (
+                self.session
+            )  # analyze copies measurement data; diagnostic path also survives failures.
+            self.dirty = True
+            self.begin(
+                lambda progress, cancel, percentage: analyze(
+                    snapshot, progress, cancel, percentage
+                ),
+                self.accept_analysis,
+                measure_analysis=True,
+            )
+
+    def accept_analysis(self, session):
+        self.accept_session(session)
+        if not session.rounds:
+            message = "分析已结束，但未识别到有效轮次。请查看检测说明，或导出诊断包。"
+            self.round_title.setText("未识别到轮次 · 检测原因如下")
+            self.details.setPlainText("\n\n".join(session.analysis_notes + session.video.warnings))
+            self.statusBar().showMessage(message)
+            QMessageBox.warning(
+                self, "没有识别到有效轮次", message + "\n\n" + "\n".join(session.analysis_notes)
+            )
+            return
+        first = next((i for i, r in enumerate(session.rounds) if r.problems()), 0)
+        self.table.selectRow(first)
+        self.select_round()
+        pending = sum(bool(r.problems()) for r in session.rounds)
+        self.statusBar().showMessage(
+            f"分析完成：检测到{len(session.rounds)}轮（预期10），{pending}轮待确认。"
+            "点击下方轮次复核，完成后导出Excel。"
+        )
+
+    def timing_changed(self):
+        self.fps.setEnabled(self.method.currentData() == "frames")
+        if self.session:
+            self.session.method = self.method.currentData()
+            self.session.fps = self.fps.value()
+            self.dirty = True
+            self.refresh_table()
+
+    def refresh_table(self):
+        if not self.session:
+            return
+        selected = self.table.currentRow()
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.session.rounds))
+        totals = []
+        for i, item in enumerate(self.session.rounds):
+            total = calculate(self.session, item)["end_to_end"]
+            if total is not None:
+                totals.append(total)
+            values = [
+                i + 1,
+                *[getattr(item, name).frame for name in EVENTS],
+                item.md,
+                item.tx,
+                None if total is None else f"{total:.2f}",
+                "；".join(item.problems()) or "已确认",
+            ]
+            for j, value in enumerate(values):
+                cell = QTableWidgetItem("—" if value is None else str(value))
+                if item.problems():
+                    cell.setForeground(QColor("#9a5300"))
+                self.table.setItem(i, j, cell)
+        self.table.blockSignals(False)
+        if not self.session.rounds and self.comparison_field is not None:
+            self.return_full_view()
+        if 0 <= selected < len(self.session.rounds):
+            self.table.selectRow(selected)
+        metadata = rate_summary(self.session.video, self.session.fps)
+        if self.session.test_start is not None:
+            metadata += f"\n有效片段：{self.session.test_start}～{self.session.test_end}帧（{self.session.range_mode}）"
+        else:
+            metadata += "\n有效片段：等待识别PRESS HERE起止，可点击“有效片段”手工设置"
+        self.metadata.setText(metadata)
+        pending = sum(bool(r.problems()) for r in self.session.rounds)
+        text = f"{len(self.session.rounds)} / 10轮 · 待确认 {pending}轮"
+        if not self.session.range_confirmed:
+            text += " · 有效片段待确认"
+        if totals:
+            text += f" · 端到端均值 {sum(totals) / len(totals):.2f} ms（有值{len(totals)}轮）"
+        self.summary.setText(text)
+
+    def select_round(self):
+        index = self.table.currentRow()
+        if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
+            return
+        self.editing = True
+        item = self.session.rounds[index]
+        self.round_title.setText(f"第 {index + 1} 轮 · 修改后点击确认")
+        for name, spin in self.event_inputs.items():
+            frame = getattr(item, name).frame
+            spin.setValue(frame if frame is not None else -1)
+        self.md.setText("" if item.md is None else str(item.md))
+        self.tx.setText("" if item.tx is None else str(item.tx))
+        self.reading_frame.setValue(item.reading_frame if item.reading_frame is not None else -1)
+        self.details.setPlainText(
+            "\n".join(item.problems()) + "\n\nOCR画面读数：\n" + item.ocr_text
+        )
+        frame = next(
+            (getattr(item, n).frame for n in EVENTS if getattr(item, n).frame is not None), None
+        )
+        if self.comparison_field is not None:
+            self.review_event(self.comparison_field)
+        elif frame is not None:
+            self.show_frame(frame)
+        else:
+            self.show_frame(-1)
+        self.editing = False
+
+    def edit_event(self, name, value):
+        index = self.table.currentRow()
+        if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
+            return
+        event = getattr(self.session.rounds[index], name)
+        event.frame = value if value >= 0 else None
+        event.state, event.reason = "review", "人工修改，待确认"
+        self.dirty = True
+        self.refresh_table()
+
+    def edit_number(self, name, text):
+        index = self.table.currentRow()
+        if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
+            return
+        try:
+            value = float(text) if text.strip() else None
+            if value is not None and not math.isfinite(value):
+                value = None
+        except ValueError:
+            value = None
+        item = self.session.rounds[index]
+        setattr(item, name, value)
+        item.reading_state, item.reading_reason = "review", "人工修改，待确认"
+        self.dirty = True
+        self.refresh_table()
+
+    def edit_reading_frame(self, value):
+        index = self.table.currentRow()
+        if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
+            return
+        item = self.session.rounds[index]
+        item.reading_frame = value if value >= 0 else None
+        item.reading_state, item.reading_reason = "review", "读数来源已修改，待确认"
+        self.dirty = True
+        self.refresh_table()
+
+    def review_cell(self, row, column):
+        if 1 <= column <= 4:
+            self.jump_event(EVENTS[column - 1])
+        elif column in (5, 6):
+            self.review_event("reading")
+
+    def jump_event(self, name):
+        self.review_event(name)
+
+    def select_current(self, name):
+        if self.current_frame < 0:
+            self.statusBar().showMessage("当前没有可用画面，请先选择原片帧")
+            return
+        if name == "reading":
+            self.reading_frame.setValue(self.current_frame)
+        else:
+            self.event_inputs[name].setValue(self.current_frame)
+
+    def confirm_round(self):
+        index = self.table.currentRow()
+        if self.session is None or not 0 <= index < len(self.session.rounds):
+            return
+        try:
+            numbers = [
+                float(edit.text()) if edit.text().strip() else None for edit in (self.md, self.tx)
+            ]
+            if any(v is not None and not math.isfinite(v) for v in numbers):
+                raise ValueError("MD/TX必须为有限数字")
+            frames = [self.event_inputs[n].value() for n in EVENTS]
+            if all(f >= 0 for f in frames) and frames != sorted(frames):
+                raise ValueError("事件顺序应为 press ≤ blink1 ≤ blink2 ≤ green")
+        except ValueError as error:
+            self.error(f"输入无效：{error}")
+            return
+        item = self.session.rounds[index]
+        for name, frame in zip(EVENTS, frames):
+            event = getattr(item, name)
+            event.frame = frame if frame >= 0 else None
+            event.state = "manual" if frame >= 0 else "review"
+            event.reason = "人工确认" if frame >= 0 else "尚未选定"
+        item.md, item.tx = numbers
+        item.reading_frame = self.reading_frame.value() if self.reading_frame.value() >= 0 else None
+        item.reading_state = "manual" if all(v is not None for v in numbers) else "review"
+        item.reading_reason = "人工确认" if item.reading_state == "manual" else "读数未填全"
+        item.issues = []
+        self.dirty = True
+        self.refresh_table()
+        self.select_round()
+
+    def add_round(self):
+        if self.session:
+            self.session.rounds.append(Round())
+            self.dirty = True
+            self.refresh_table()
+            self.table.selectRow(len(self.session.rounds) - 1)
+
+    def remove_round(self):
+        index = self.table.currentRow()
+        if self.session and 0 <= index < len(self.session.rounds):
+            if QMessageBox.question(self, "删除误检", f"删除第{index + 1}轮？") == QMessageBox.Yes:
+                self.session.rounds.pop(index)
+                self.dirty = True
+                self.refresh_table()
+                self.select_round()
+
+    def save_task(self):
+        if self.session is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存任务", "analysis.session.json", "任务 (*.json)"
+        )
+        if path:
+            try:
+                save_session(self.session, Path(path))
+            except OSError as error:
+                self.error(str(error))
+            else:
+                self.dirty = False
+                self.statusBar().showMessage("任务已保存")
+
+    def open_task(self):
+        if not self.may_replace():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "打开任务", "", "任务 (*.json)")
+        if path:
+            try:
+                session = load_session(Path(path))
+                if not Path(session.video.path).exists():
+                    source, _ = QFileDialog.getOpenFileName(self, "原片已移动，请选择同一个原视频")
+                    if not source:
+                        return
+                    session.video.path = source
+                check_source(session.video)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                self.error(f"任务无法打开：{error}")
+                return
+            self.accept_session(session)
+            self.dirty = False
+
+    def export(self):
+        if self.session is None:
+            return
+        parent = QFileDialog.getExistingDirectory(self, "选择结果保存位置")
+        if not parent:
+            return
+        folder = Path(parent) / datetime.now().strftime("PCTS_%Y%m%d_%H%M%S_%f")
+        snapshot = copy.deepcopy(self.session)
+        self.begin(
+            lambda progress, cancel, percentage: export_report(
+                snapshot, folder, cancelled=cancel, progress=progress
+            ),
+            lambda path: self.statusBar().showMessage(f"已导出：{path}"),
+        )
+
+    def configure_touch(self):
+        if self.session is None:
+            return
+        if "touch" not in self.session.rois:
+            QMessageBox.information(
+                self, "触摸校准", "请先框选包含指腹接近和接触位置的触摸观察区域"
+            )
+            return
+        self.return_full_view()
+        session = self.session
+        roi = session.rois["touch"]
+        width, height = session.video.width, session.video.height
+        x0 = math.floor(min(roi[::2]) * (width - 1))
+        y0 = math.floor(min(roi[1::2]) * (height - 1))
+        x1 = math.ceil(max(roi[::2]) * (width - 1)) + 1
+        y1 = math.ceil(max(roi[1::2]) * (height - 1)) + 1
+        dialog = QDialog(self)
+        dialog.setWindowTitle("触摸校准 · 接触参考线与指腹取样")
+        dialog.resize(650, 600)
+        layout = QVBoxLayout(dialog)
+        instructions = QLabel(
+            "选择一帧明确已接触的画面（不必是首次接触帧）。\n"
+            "依次点击：接触参考线两端 → 指腹内部。参考线应穿过实际落点；不要使用远处屏幕边框。\n"
+            "该线用于图像位置比较；看不清真实间隙时，结果仍需复核。右键撤销上一点。"
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        frame = QSpinBox()
+        frame.setPrefix("参考原帧：")
+        frame.setRange(0, len(session.video.times) - 1)
+        frame.setKeyboardTracking(False)
+        frame.setValue(
+            session.touch_calibration.frame if session.touch_calibration else self.current_frame
+        )
+        layout.addWidget(frame)
+        canvas = CalibrationCanvas()
+        canvas.setMinimumSize(540, 360)
+        layout.addWidget(canvas, 1)
+        hint = QLabel()
+        layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("保存校准")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        reset = buttons.addButton("重新点选", QDialogButtonBox.ResetRole)
+        clear = buttons.addButton("清除已有校准", QDialogButtonBox.DestructiveRole)
+        clear.setEnabled(session.touch_calibration is not None)
+        layout.addWidget(buttons)
+        reference = None
+        selected = session.touch_calibration
+
+        def refresh_hint():
+            hint.setText(
+                (
+                    "点击参考线第一个端点",
+                    "点击参考线第二个端点",
+                    "点击指腹内部取样点",
+                    "三点已设置，可保存；更改后需重新分析press",
+                )[len(canvas.points)]
+            )
+            buttons.button(QDialogButtonBox.Ok).setEnabled(
+                len(canvas.points) == 3 and reference is not None
+            )
+
+        def load_reference():
+            nonlocal reference
+            try:
+                reference = read_frame(session.video, frame.value())
+            except (OSError, ValueError) as error:
+                reference = None
+                QMessageBox.warning(dialog, "无法读取参考帧", str(error))
+            else:
+                canvas.set_image(reference[y0:y1, x0:x1])
+            refresh_hint()
+
+        def save():
+            nonlocal selected
+            points = [
+                [(x0 + x * (x1 - x0 - 1)) / (width - 1), (y0 + y * (y1 - y0 - 1)) / (height - 1)]
+                for x, y in canvas.points
+            ]
+            proposed = TouchCalibration(frame.value(), points[0] + points[1], points[2])
+            try:
+                validate_touch_calibration(proposed, session.video, roi)
+                ContactTracker(reference, roi, proposed)
+            except ValueError as error:
+                QMessageBox.warning(dialog, "校准未保存", str(error))
+                return
+            selected = proposed
+            dialog.accept()
+
+        def clear_saved():
+            nonlocal selected
+            selected = None
+            dialog.accept()
+
+        def reset_points():
+            canvas.points = []
+            canvas.update()
+            refresh_hint()
+
+        if session.touch_calibration:
+            c = session.touch_calibration
+            points = list(zip(c.line[::2], c.line[1::2])) + [c.skin_point]
+            canvas.points = [
+                [(x * (width - 1) - x0) / (x1 - x0 - 1), (y * (height - 1) - y0) / (y1 - y0 - 1)]
+                for x, y in points
+            ]
+        canvas.points_changed.connect(refresh_hint)
+        frame.valueChanged.connect(load_reference)
+        buttons.accepted.connect(save)
+        buttons.rejected.connect(dialog.reject)
+        reset.clicked.connect(reset_points)
+        clear.clicked.connect(clear_saved)
+        load_reference()
+        if dialog.exec() != QDialog.Accepted or selected == session.touch_calibration:
+            return
+        session.touch_calibration = selected
+        for item in session.rounds:
+            if item.press.state != "manual":
+                item.press = Event(reason="触摸校准已更改，请重新分析")
+        self.calibration_button.setText("触摸已校准" if selected else "触摸校准")
+        self.region_combo.setCurrentIndex(0)
+        self.dirty = True
+        self.refresh_table()
+        self.select_round()
+        if selected:
+            self.show_frame(selected.frame)
+        self.statusBar().showMessage(
+            "触摸校准已保存，请重新分析" if selected else "触摸校准已清除；重新分析将使用关键点候选"
+        )
+
+    def configure_range(self):
+        if self.session is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("有效测试片段")
+        layout = QFormLayout(dialog)
+        mode = QComboBox()
+        mode.addItem("自动：PRESS HERE出现至消失", "auto")
+        mode.addItem("手工指定原片帧范围", "manual")
+        mode.setCurrentIndex(0 if self.session.range_mode == "auto" else 1)
+        layout.addRow("方式", mode)
+        start, end = QSpinBox(), QSpinBox()
+        for spin in (start, end):
+            spin.setRange(0, len(self.session.video.times) - 1)
+        start.setValue(self.session.test_start or 0)
+        end.setValue(
+            self.session.test_end
+            if self.session.test_end is not None
+            else len(self.session.video.times) - 1
+        )
+        end.setMinimum(start.value())
+        start.valueChanged.connect(end.setMinimum)
+        layout.addRow("起帧（包含）", start)
+        layout.addRow("止帧（包含）", end)
+        for spin in (start, end):
+            spin.setEnabled(mode.currentData() == "manual")
+        mode.currentIndexChanged.connect(lambda: start.setEnabled(mode.currentData() == "manual"))
+        mode.currentIndexChanged.connect(lambda: end.setEnabled(mode.currentData() == "manual"))
+        info = QLabel(
+            "自动模式忽略开始前与结束后的片段；文字短暂被遮挡时不会立即结束。\n自动边界有疑问时，可在原片查看帧号后手工确认范围。"
+        )
+        info.setWordWrap(True)
+        layout.addRow(info)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = (start.value(), end.value()) if mode.currentData() == "manual" else (None, None)
+        if mode.currentData() == self.session.range_mode and (
+            mode.currentData() == "auto"
+            or selected == (self.session.test_start, self.session.test_end)
+        ):
+            if mode.currentData() == "manual":
+                self.session.range_confirmed = True
+                self.dirty = True
+                self.refresh_table()
+            return
+        changed = selected != (self.session.test_start, self.session.test_end)
+        if (
+            changed
+            and self.session.rounds
+            and QMessageBox.question(
+                self, "重新分析", "有效片段改变后需要重新分析，清空当前结果并继续？"
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        self.session.range_mode = mode.currentData()
+        self.session.test_start, self.session.test_end = selected
+        self.session.range_confirmed = self.session.range_mode == "manual"
+        if changed:
+            self.session.rounds = []
+            self.session.analysis_notes = []
+        self.dirty = True
+        self.refresh_table()
+        self.statusBar().showMessage("有效片段设置已更新；范围变化后请重新分析")
+
+    def show_analysis_notes(self):
+        text = (
+            "\n\n".join(self.session.analysis_notes + self.session.video.warnings)
+            if self.session
+            else "尚未分析"
+        )
+        QMessageBox.information(self, "检测说明", text + f"\n\n诊断日志位置：{log_directory()}")
+
+    def export_debug(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出诊断包", "PCTS-diagnostics.zip", "诊断包 (*.zip)"
+        )
+        if path:
+            try:
+                export_diagnostics(self.session, Path(path))
+            except OSError as error:
+                self.error(str(error))
+            else:
+                self.statusBar().showMessage(
+                    f"诊断包已导出：{path}（含日志和识别数据，不含原视频）"
+                )
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.cancel_work()
+            event.ignore()
+            return
+        if self.may_replace():
+            event.accept()
+        else:
+            event.ignore()

@@ -1,0 +1,16 @@
+.venv/
+.venv-win/
+.runtime/
+.build-venv/
+release/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+windows-build-location.txt
+models/*.task
+*.session.json
+

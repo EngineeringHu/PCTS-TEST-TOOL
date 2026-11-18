@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import av
+import cv2
+import numpy as np
+
+from .models import VideoInfo
+
+
+def display_image(frame: av.VideoFrame) -> np.ndarray:
+    image = frame.to_ndarray(format="bgr24")
+    rotation = int(frame.rotation)
+    if rotation % 90:
+        raise ValueError(f"暂不支持{rotation}度非直角旋转视频")
+    return np.ascontiguousarray(np.rot90(image, rotation // 90))
+
+
+def read_frame(info: VideoInfo, index: int) -> np.ndarray:
+    """Exact presentation index; sequential fallback also works without unique PTS."""
+    with av.open(info.path) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        target = info.times[index]
+        if target is not None and all(
+            b is not None and a is not None and b > a for a, b in zip(info.times, info.times[1:])
+        ):
+            container.seek(int(target / stream.time_base), stream=stream, backward=True)
+            for frame in container.decode(stream):
+                if frame.pts is not None:
+                    t = float(frame.pts * frame.time_base)
+                    if abs(t - target) < 1e-8:
+                        return display_image(frame)
+                    if t > target + 1e-8:
+                        break
+    with av.open(info.path) as container:
+        for i, frame in enumerate(container.decode(video=0)):
+            if i == index:
+                return display_image(frame)
+    raise ValueError(f"无法读取原片第{index}帧")
+
+
+def inspect_video(path: str, progress=None, cancelled=None, sample=None) -> VideoInfo:
+    times = []
+    source = Path(path).resolve()
+    with av.open(str(source)) as container:
+        if not container.streams.video:
+            raise ValueError("文件没有视频轨道")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        average = float(stream.average_rate or 0)
+        nominal = float(stream.base_rate or 0)
+        width, height, rotation = stream.width, stream.height, 0
+        for index, frame in enumerate(container.decode(stream)):
+            if cancelled and cancelled():
+                raise InterruptedError("已取消")
+            times.append(None if frame.pts is None else float(frame.pts * frame.time_base))
+            if index == 0 or sample:
+                image = display_image(frame)
+                height, width = image.shape[:2]
+                rotation = int(frame.rotation)
+                if sample:
+                    sample(index, image)
+            if progress and index % 120 == 0:
+                progress(f"正在逐帧读取：{index + 1} / {stream.frames or '?'}")
+    if not times:
+        raise ValueError("视频中没有可解码画面")
+    if len(times) > 1 and times[0] is not None and times[-1] is not None and times[-1] > times[0]:
+        average = (len(times) - 1) / (times[-1] - times[0])
+    stat = source.stat()
+    info = VideoInfo(
+        str(source),
+        width,
+        height,
+        stat.st_size,
+        stat.st_mtime_ns,
+        times,
+        nominal,
+        average,
+        rotation,
+    )
+    intervals = [b - a for a, b in zip(times, times[1:]) if a is not None and b is not None]
+    if any(t is None for t in times):
+        info.warnings.append("部分帧缺少时间戳；涉及这些帧的时间戳计算不可用")
+    if any(d <= 0 for d in intervals):
+        info.warnings.append("时间戳不严格递增，请核实文件时间轴")
+    long_count = sum(d > 1.5 / 240 for d in intervals)
+    if long_count:
+        info.warnings.append(f"相对240 fps存在{long_count}处长间隔（>6.25 ms）")
+    return info
+
+
+def rate_summary(info: VideoInfo, fps: float) -> str:
+    deltas = np.array(
+        [b - a for a, b in zip(info.times, info.times[1:]) if a is not None and b is not None]
+    )
+    head = (
+        f"{info.width}×{info.height} · {len(info.times)}帧 · "
+        f"帧间隔估算{sampling_fps(info):.3f} fps · 时间轴平均{info.average_fps:.3f} fps"
+    )
+    if not len(deltas):
+        return head + "\n没有足够时间戳可检查帧间隔"
+    long_count = int(np.count_nonzero(deltas > 1.5 / fps))
+    return (
+        head + f"\n相邻帧间隔 {deltas.min() * 1000:.3f}～{deltas.max() * 1000:.3f} ms；"
+        f"相对{fps:g} fps的长间隔 {long_count}处。帧号从0开始。"
+    )
+
+
+def sampling_fps(info: VideoInfo) -> float:
+    """Detection cadence comes from frame timestamps, never FFmpeg's base-rate guess."""
+    deltas = [
+        b - a
+        for a, b in zip(info.times, info.times[1:])
+        if a is not None and b is not None and b > a
+    ]
+    return 1 / float(np.median(deltas)) if deltas else (info.average_fps or 240.0)
+
+
+def crop(image: np.ndarray, roi: list[float]) -> np.ndarray:
+    """Rectify a four-corner region for OCR; frame numbering is unchanged."""
+    h, w = image.shape[:2]
+    points = np.array(roi, np.float32).reshape(4, 2) * [w - 1, h - 1]
+    out_w = max(
+        2,
+        round(max(np.linalg.norm(points[1] - points[0]), np.linalg.norm(points[2] - points[3])))
+        + 1,
+    )
+    out_h = max(
+        2,
+        round(max(np.linalg.norm(points[3] - points[0]), np.linalg.norm(points[2] - points[1])))
+        + 1,
+    )
+    target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
+    matrix = cv2.getPerspectiveTransform(points.astype(np.float32), target)
+    return cv2.warpPerspective(image, matrix, (out_w, out_h), borderMode=cv2.BORDER_REPLICATE)
