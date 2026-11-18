@@ -19,6 +19,7 @@ def self_test(output: str) -> int:
 
         from .analysis import analyze
         from .detection import TextColorTracker, refine_green_start
+        from .exporting import export_report
         from .models import Event, Round, Session, TouchCalibration
         from .motion import MotionTracker, automatic_finger_samples, locate_motion_press
         from .recognition import create_hand_detector, create_ocr, fingertip, read_numbers
@@ -95,6 +96,38 @@ def self_test(output: str) -> int:
                 raise ValueError("视频解码自检失败")
             av.Codec("hevc", "r")
             report["checks"].append("视频：解码、精确回看、HEVC解码器可用")
+            template_result = export_report(
+                Session(
+                    info,
+                    rounds=[
+                        Round(
+                            press=Event(0),
+                            blink1=Event(1),
+                            blink2=Event(1),
+                            green=Event(2),
+                            md=12.5,
+                            tx=-0.5,
+                        )
+                    ],
+                ),
+                Path(directory) / "template-export",
+                evidence=False,
+            )
+            from xml.etree import ElementTree as ET
+
+            with ZipFile(template_result) as archive:
+                ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                cells = {
+                    c.get("r"): c
+                    for c in ET.fromstring(archive.read("xl/worksheets/sheet2.xml")).iter(ns + "c")
+                }
+                if (
+                    cells["A6"].find(ns + "v").text != "0"
+                    or cells["G6"].find(ns + "v").text != "2"
+                    or abs(float(cells["O6"].find(ns + "v").text) - 1000 / 120) > 1e-8
+                ):
+                    raise ValueError("模板Excel填写或耗时缓存错误")
+            report["checks"].append("Excel模板：内置工作簿可用，T1 (2)字段映射与耗时缓存正确")
             os.environ["PCTS_LOG_DIR"] = str(Path(directory) / "diagnostics")
             trial = Session(info)
             try:

@@ -145,3 +145,13 @@ UI提供自动/单点取样/旧参考线三种方式，默认自动；点选时�
 ## 0.5.2缺失单元格悬停提示
 
 用户要求显示“—”的单元格在鼠标悬停时自动浮现说明，press与其他字段使用不同文案，并提供默认开启的开关。使用Qt原生单元格ToolTip，无需点击；表格下方增加可切换按钮。仅为缺失值设置提示，已有值保持无提示；刷新结果、编辑与重新打开任务后按当前开关更新。关闭收起正在显示的提示，不重建表格、不更改选中行、浏览帧或测量值。提示补充blink1缺失时需手动定位，以及耗时字段需补齐事件后自动计算的实际条件。
+
+## 0.6.0按用户Excel模板导出
+
+用户指定`docs/AI_performance_test.xlsx`，并确认填写`T1 (2)`，平均值和样本标准差统计全部10轮。第6～15行映射A=press、B=blink1、C=blink2、G=green、I=MD、J=TX；同一原片的E/F沿用对应B/C，不引入跨视频偏移。保留T1原页和原样式，原模板文件只读。修复导出副本中F6/F7/M13/O13的错行引用，重新写入本区域有限公式和缓存，缺失数据不参与计算或统计，缓存不沿用模板旧值。
+
+固定模板采用标准库ZIP/XML定点修改，保留未修改部件的字节；不实现通用Excel编辑器或公式引擎，不新增依赖。XlsxWriter继续生成原有工具明细工作簿，主要返回路径改为模板结果；结果JSON和证据PNG保持原流程。模板只有10个输入行，多于10轮时明确要求先复核轮次，不截断；不足10轮时清空余下输入并标草稿。
+
+主表永远保存原片帧号。时间戳模式在Y:AB隐藏列保存四个事件PTS秒值，O/P/Q/R按PTS差计算；帧数模式按B20的FPS计算。C20说明实际口径，打开Excel请求自动重算；写入缓存确保无需Excel计算引擎也能预览。用例对应的有效值与既有calculate()逐项一致，blink缺失不抹掉仍可由press/green计算的端到端。公式用必要字段COUNT判断，避免缺失TX被当成0。
+
+模板随源码和EXE打包，最终用户不依赖开发机路径。依据：[XlsxWriter不修改既有文件](https://xlsxwriter.readthedocs.io/faq.html)、[openpyxl不计算公式](https://openpyxl.readthedocs.io/en/stable/simple_formulae.html)、[OOXML公式缓存](https://learn.microsoft.com/en-us/office/open-xml/spreadsheet/working-with-formulas)。

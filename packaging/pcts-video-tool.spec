@@ -4,6 +4,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 root = Path(SPECPATH).parent
 datas = collect_data_files("rapidocr") + [(str(root / "models" / "hand_landmarker.task"), "models")]
+datas += [(str(root / "docs" / "AI_performance_test.xlsx"), "templates")]
 binaries = collect_dynamic_libs("mediapipe")
 # Wine cannot always query QtLibraryInfo; collect the actual Windows GUI plugins explicitly.
 qt_root = Path(find_spec("PySide6").origin).parent

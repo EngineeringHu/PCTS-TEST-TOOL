@@ -9,6 +9,7 @@ import cv2
 import xlsxwriter
 
 from .models import EVENTS, METRICS, Session, calculate, check_source
+from .template_export import write_template_report
 from .video import rate_summary, read_frame
 
 
@@ -20,11 +21,19 @@ def export_report(
     progress=lambda message: None,
 ) -> Path:
     check_source(session.video)
+    if len(session.rounds) > 10:
+        raise ValueError(
+            f"Excel模板预留10轮，当前有{len(session.rounds)}轮；请先复核轮次后再导出，不会截断数据"
+        )
+    if cancelled():
+        raise InterruptedError("已取消导出，未生成最终报告")
     destination.mkdir(parents=True, exist_ok=False)
     problems = session.problems()
     status = "草稿：存在待确认或缺失数据" if problems else "数据已确认（不包含合格判定）"
     target = destination / ("测量结果-草稿.xlsx" if problems else "测量结果.xlsx")
     temporary = destination / "writing.xlsx"
+    detail = destination / ("测量明细-草稿.xlsx" if problems else "测量明细.xlsx")
+    template_temporary = destination / "template-writing.xlsx"
     with xlsxwriter.Workbook(temporary) as book:
         header = book.add_format({"bold": True, "bg_color": "#17324D", "font_color": "white"})
         number = book.add_format({"num_format": "0.00"})
@@ -138,6 +147,10 @@ def export_report(
         ]
         for i, text in enumerate(texts):
             notes.write(i, 0, text)
+    if cancelled():
+        raise InterruptedError("已取消导出，未生成最终报告")
+    progress("填写Excel模板T1 (2)，统计全部10轮…")
+    write_template_report(session, template_temporary, status)
     if evidence:
         for i, item in enumerate(session.rounds, 1):
             progress(f"导出第{i}/{len(session.rounds)}轮证据")
@@ -163,5 +176,8 @@ def export_report(
         ),
         encoding="utf-8",
     )
-    temporary.replace(target)
+    if cancelled():
+        raise InterruptedError("已取消导出，未生成最终报告")
+    temporary.replace(detail)
+    template_temporary.replace(target)
     return target
