@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcts-video-tool"
-version = "0.5.0"
+version = "0.5.2"
 description = "Local video measurement and review tool for ten-round touch latency tests"
 requires-python = ">=3.10,<3.14"
 dependencies = [

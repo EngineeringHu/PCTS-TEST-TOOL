@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -438,9 +439,13 @@ class MainWindow(QMainWindow):
         self.video_views = QStackedWidget()
         self.video_views.addWidget(self.canvas)
         self.video_views.addWidget(self.comparison)
-        self.comparison.back_button.clicked.connect(self.return_full_view)
+        self.comparison.back_button.clicked.connect(lambda: self.review_layout.setCurrentIndex(1))
         self.comparison.crop_only.toggled.connect(lambda: self.show_frame(self.current_frame))
         lv.addWidget(self.video_views, 1)
+        self.review_hint = QLabel()
+        self.review_hint.setWordWrap(True)
+        self.review_hint.hide()
+        lv.addWidget(self.review_hint)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self.slider_changed)
         lv.addWidget(self.slider)
@@ -458,6 +463,11 @@ class MainWindow(QMainWindow):
         navigation.addWidget(self.frame_input)
         self.time_label = QLabel("—")
         navigation.addWidget(self.time_label)
+        self.review_layout = QComboBox()
+        self.review_layout.addItem("三帧对照", "comparison")
+        self.review_layout.addItem("单幅全画面", "full")
+        self.review_layout.currentIndexChanged.connect(self.change_review_layout)
+        navigation.addWidget(self.review_layout)
         lv.addLayout(navigation)
         roi_bar = QHBoxLayout()
         self.region_combo = QComboBox()
@@ -578,6 +588,11 @@ class MainWindow(QMainWindow):
         footer = QHBoxLayout()
         self.summary = QLabel("尚未导入视频")
         footer.addWidget(self.summary, 1)
+        self.missing_hints_button = QPushButton("缺失项提示：开")
+        self.missing_hints_button.setCheckable(True)
+        self.missing_hints_button.setChecked(True)
+        self.missing_hints_button.toggled.connect(self.update_missing_hints)
+        footer.addWidget(self.missing_hints_button)
         add = QPushButton("补充缺失轮次")
         add.clicked.connect(self.add_round)
         remove = QPushButton("删除误检轮次")
@@ -762,6 +777,23 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.set_image(image)
         if self.comparison_field is not None:
+            item = self.session.rounds[self.table.currentRow()]
+            hint = ""
+            if self.comparison_field == "press" and item.press.frame is None:
+                if item.blink1.frame is None:
+                    hint = "press与blink 1均未识别，无法定位查找起点；请用下方导航手工定位。"
+                else:
+                    start = max(0, item.blink1.frame - 20)
+                    hint = (
+                        f"press未识别：从blink 1前20帧（原片第{start}帧）开始人工查找；"
+                        "仅浏览，未写入press。"
+                    )
+            self.review_hint.setText(hint)
+            self.review_hint.setVisible(bool(hint))
+        if (
+            self.comparison_field is not None
+            and self.video_views.currentWidget() is self.comparison
+        ):
             name = self.comparison_field
             region = REVIEW_REGIONS[name]
             roi = self.session.rois.get(region) if self.comparison.crop_only.isChecked() else None
@@ -814,9 +846,19 @@ class MainWindow(QMainWindow):
 
     def return_full_view(self):
         self.comparison_field = None
+        self.review_hint.hide()
         self.video_views.setCurrentWidget(self.canvas)
         self.region_visibility.setEnabled(True)
         self.shape_combo.setEnabled(True)
+
+    def change_review_layout(self):
+        if self.comparison_field is None:
+            return
+        three_frames = self.review_layout.currentData() == "comparison"
+        self.video_views.setCurrentWidget(self.comparison if three_frames else self.canvas)
+        self.region_visibility.setEnabled(not three_frames)
+        self.shape_combo.setEnabled(not three_frames)
+        self.show_frame(self.current_frame)
 
     def review_event(self, name):
         row = self.table.currentRow()
@@ -824,11 +866,14 @@ class MainWindow(QMainWindow):
             return
         self.region_combo.setCurrentIndex(0)
         self.comparison_field = name
-        self.video_views.setCurrentWidget(self.comparison)
-        self.region_visibility.setEnabled(False)
-        self.shape_combo.setEnabled(False)
+        three_frames = self.review_layout.currentData() == "comparison"
+        self.video_views.setCurrentWidget(self.comparison if three_frames else self.canvas)
+        self.region_visibility.setEnabled(not three_frames)
+        self.shape_combo.setEnabled(not three_frames)
         item = self.session.rounds[row]
         frame = item.reading_frame if name == "reading" else getattr(item, name).frame
+        if name == "press" and frame is None and item.blink1.frame is not None:
+            frame = max(0, item.blink1.frame - 20)
         self.show_frame(frame if frame is not None else -1)
 
     def slider_changed(self, value):
@@ -949,6 +994,7 @@ class MainWindow(QMainWindow):
                 if item.problems():
                     cell.setForeground(QColor("#9a5300"))
                 self.table.setItem(i, j, cell)
+        self.update_missing_hints()
         self.table.blockSignals(False)
         if not self.session.rounds and self.comparison_field is not None:
             self.return_full_view()
@@ -967,6 +1013,30 @@ class MainWindow(QMainWindow):
         if totals:
             text += f" · 端到端均值 {sum(totals) / len(totals):.2f} ms（有值{len(totals)}轮）"
         self.summary.setText(text)
+
+    def update_missing_hints(self):
+        enabled = self.missing_hints_button.isChecked()
+        self.missing_hints_button.setText("缺失项提示：开" if enabled else "缺失项提示：关")
+        if not enabled:
+            QToolTip.hideText()
+        for row in range(self.table.rowCount()):
+            for column in range(self.table.columnCount()):
+                cell = self.table.item(row, column)
+                text = ""
+                if enabled and cell.text() == "—":
+                    if column == 1:
+                        text = (
+                            "未找到对应帧，单击会自动跳转到点击屏幕前方便人工查找。\n"
+                            "参考起点为本轮blink 1前20帧；blink 1缺失时请手动定位。"
+                        )
+                    else:
+                        text = (
+                            "未自动识别到，单击可以显示对应画面方便人工填写。\n"
+                            "没有可用参考帧时，请用下方导航查找。"
+                        )
+                        if column == 7:
+                            text += "\n耗时在补齐press和green后自动计算。"
+                cell.setToolTip(text)
 
     def select_round(self):
         index = self.table.currentRow()
@@ -1004,6 +1074,8 @@ class MainWindow(QMainWindow):
         event.state, event.reason = "review", "人工修改，待确认"
         self.dirty = True
         self.refresh_table()
+        if self.comparison_field == "press" and name in ("press", "blink1"):
+            self.show_frame(self.current_frame)
 
     def edit_number(self, name, text):
         index = self.table.currentRow()
@@ -1036,6 +1108,8 @@ class MainWindow(QMainWindow):
             self.jump_event(EVENTS[column - 1])
         elif column in (5, 6):
             self.review_event("reading")
+        else:
+            self.review_event(self.comparison_field or "press")
 
     def jump_event(self, name):
         self.review_event(name)

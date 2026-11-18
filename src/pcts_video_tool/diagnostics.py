@@ -128,7 +128,9 @@ def self_test(output: str) -> int:
             window = MainWindow()
             window.accept_session(
                 Session(
-                    info, rois={"green": [0, 0, 1, 0, 1, 1, 0, 1]}, rounds=[Round(green=Event(1))]
+                    info,
+                    rois={"green": [0, 0, 1, 0, 1, 1, 0, 1]},
+                    rounds=[Round(green=Event(1), blink1=Event(2))],
                 )
             )
             window.table.selectRow(0)
@@ -141,6 +143,18 @@ def self_test(output: str) -> int:
             if not window.elapsed_label.text().endswith("00:01:05"):
                 raise ValueError("分析用时显示自检失败")
             report["checks"].append("复核：选区三帧对照与分析用时显示可用")
+            window.comparison.back_button.click()
+            window.review_cell(0, 2)
+            if window.video_views.currentWidget() is not window.canvas or window.current_frame != 2:
+                raise ValueError("单幅全画面模式未跨单元格保留")
+            window.review_cell(0, 1)
+            if window.current_frame != 0 or window.session.rounds[0].press.frame is not None:
+                raise ValueError("缺失press辅助浏览起点或只读状态错误")
+            window.step(1)
+            window.review_layout.setCurrentIndex(0)
+            if window.comparison.frame_indices != [0, 1, 2]:
+                raise ValueError("切回三帧模式未保留浏览帧")
+            report["checks"].append("复核导航：显示模式跨单元格保留，缺失press辅助定位不写入测量值")
             window.show()
             app.processEvents()
             if window.grab().isNull():
