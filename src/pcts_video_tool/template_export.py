@@ -81,9 +81,8 @@ def write_template_report(session: Session, target: Path, status: str) -> None:
             elif value is not None:
                 ET.SubElement(cell, MAIN + "v").text = str(value)
 
-        write(
-            "A2", f"{status}；当前{len(session.rounds)}/10轮；本次结果为T1 (2)，T1保留模板原内容。"
-        )
+        note = "；其他工作表保留模板原内容" if len(sheets) > 1 else ""
+        write("A2", f"{status}；当前{len(session.rounds)}/10轮；本次结果为T1 (2){note}。")
         write("B20", session.fps)
         write(
             "C20",

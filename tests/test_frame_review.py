@@ -292,3 +292,66 @@ def test_missing_press_uses_the_clicked_rounds_blink1(review_window):
     assert window.current_frame == 160
     assert window.comparison.frame_indices == [159, 160, 161]
     assert all(item.press.frame is None for item in window.session.rounds)
+
+
+def test_rapid_frame_steps_and_cached_revisit_preserve_measurements(review_window):
+    window = review_window
+    original = deepcopy(window.session.rounds)
+    click_cell(window, 0, 4)
+    seen = []
+    for step in [1] * 12 + [-1] * 20 + [1] * 8:
+        previous = window.current_frame
+        window.step(step)
+        assert window.current_frame == previous + step
+        assert window.comparison.frame_indices == [
+            window.current_frame - 1,
+            window.current_frame,
+            window.current_frame + 1,
+        ]
+        seen.append(window.current_frame)
+    assert seen[-1] == 50 and window.session.rounds == original
+    window.step(4)
+    click_cell(window, 0, 4)
+    assert window.current_frame == 50  # Clicking the same cell still returns to the event frame.
+
+
+def test_reader_is_released_on_task_replacement_and_window_close(review_window, generated_video):
+    window = review_window
+    click_cell(window, 0, 4)
+    old = window.frame_reader
+    assert old.container is not None and old.cache
+    replacement = deepcopy(window.session)
+    replacement.rounds = []
+    window.accept_session(replacement)
+    assert old.container is None and old.decoder is None and not old.cache
+    assert window.frame_reader is not old
+    active = window.frame_reader
+    window.dirty = False
+    window.close()
+    assert active.container is None and not active.cache
+
+
+def test_neighbor_failure_stays_empty_and_center_failure_clears_old_picture(
+    review_window, monkeypatch
+):
+    window = review_window
+    actual = window.frame_reader.read
+    broken = {49}
+
+    def reading(index):
+        if index in broken:
+            raise ValueError("模拟读取失败")
+        return actual(index)
+
+    monkeypatch.setattr(window.frame_reader, "read", reading)
+    click_cell(window, 0, 4)
+    assert window.current_frame == 50
+    assert window.comparison.panes[0].pixmap.isNull()
+    assert not window.comparison.panes[1].pixmap.isNull()
+    errors = []
+    monkeypatch.setattr(window, "error", errors.append)
+    broken.add(50)
+    click_cell(window, 0, 4)
+    assert window.current_frame == -1 and window.frame_input.value() == -1
+    assert all(pane.pixmap.isNull() for pane in window.comparison.panes)
+    assert window.session.rounds[0].green.frame == 50 and errors

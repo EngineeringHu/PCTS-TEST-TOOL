@@ -34,9 +34,21 @@ def test_export_does_not_overwrite_existing_directory(session, generated_video, 
         export_report(session, tmp_path, evidence=False)
 
 
+def template_location(book):
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    relationship = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    workbook = ET.fromstring(book.read("xl/workbook.xml"))
+    sheet = next(s for s in workbook.find(ns + "sheets") if s.get("name") == "T1 (2)")
+    relationships = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    location = next(
+        r.get("Target") for r in relationships if r.get("Id") == sheet.get(relationship)
+    )
+    return location.lstrip("/") if location.startswith("/") else "xl/" + location
+
+
 def template_cells(path):
     with ZipFile(path) as book:
-        tree = ET.fromstring(book.read("xl/worksheets/sheet2.xml"))
+        tree = ET.fromstring(book.read(template_location(book)))
     ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     return {c.get("r"): c for c in tree.iter(ns + "c")}
 
@@ -93,12 +105,14 @@ def test_template_mapping_formulas_caches_and_original_parts_are_preserved(
     assert all(not c.find(ns + "f").attrib for c in cells.values() if c.find(ns + "f") is not None)
     assert cells["I17"].get("t") != "e"
     with ZipFile(target) as output, ZipFile(template_path()) as source:
+        location = template_location(source)
+        assert template_location(output) == location
         assert output.namelist() == source.namelist()
         for name in source.namelist():
-            if name not in ("xl/worksheets/sheet2.xml", "xl/workbook.xml"):
+            if name not in (location, "xl/workbook.xml"):
                 assert output.read(name) == source.read(name)
-        before = ET.fromstring(source.read("xl/worksheets/sheet2.xml"))
-        after = ET.fromstring(output.read("xl/worksheets/sheet2.xml"))
+        before = ET.fromstring(source.read(location))
+        after = ET.fromstring(output.read(location))
         for index in range(1, 25):
             old = next(
                 c
@@ -120,7 +134,8 @@ def test_template_mapping_formulas_caches_and_original_parts_are_preserved(
         assert all(c.get("s") == cells[a].get("s") for a, c in before_cells.items())
         book = ET.fromstring(output.read("xl/workbook.xml"))
         assert book.find(ns + "calcPr").get("fullCalcOnLoad") == "1"
-        assert book.find(ns + "bookViews/" + ns + "workbookView").get("activeTab") == "1"
+        active = int(book.find(ns + "bookViews/" + ns + "workbookView").get("activeTab", "0"))
+        assert list(book.find(ns + "sheets"))[active].get("name") == "T1 (2)"
     assert template_path().read_bytes() == original
     assert list(target.parent.glob("测量明细*.xlsx"))
 

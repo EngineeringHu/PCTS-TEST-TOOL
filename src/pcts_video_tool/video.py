@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections import OrderedDict
 from pathlib import Path
 
 import av
@@ -39,6 +41,82 @@ def read_frame(info: VideoInfo, index: int) -> np.ndarray:
             if i == index:
                 return display_image(frame)
     raise ValueError(f"无法读取原片第{index}帧")
+
+
+class FrameReader:
+    """UI-owned exact-frame reader; bounded raw-image cache, no sampling or background work."""
+
+    def __init__(self, info: VideoInfo, max_bytes: int = 96 * 1024 * 1024):
+        self.info = info
+        self.max_bytes = max_bytes
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.container = None
+        self.stream = None
+        self.decoder = None
+        self.last_index = -1
+        self.seekable = all(t is not None for t in info.times) and all(
+            b > a for a, b in zip(info.times, info.times[1:])
+        )
+
+    def _remember(self, index, image):
+        old = self.cache.pop(index, None)
+        if old is not None:
+            self.cache_bytes -= old.nbytes
+        self.cache[index] = image
+        self.cache_bytes += image.nbytes
+        while self.cache_bytes > self.max_bytes:
+            _, removed = self.cache.popitem(last=False)
+            self.cache_bytes -= removed.nbytes
+        return image
+
+    def read(self, index: int) -> np.ndarray:
+        if index in self.cache:
+            self.cache.move_to_end(index)
+            return self.cache[index]
+        if not self.seekable:
+            return self._remember(index, read_frame(self.info, index))
+        if self.container is None:
+            self.container = av.open(self.info.path)
+            self.stream = self.container.streams.video[0]
+            self.stream.thread_type = "AUTO"
+            self.decoder = iter(self.container.decode(self.stream))
+            self.last_index = -1
+        if not self.last_index < index <= self.last_index + 32:
+            target = self.info.times[index]
+            self.container.seek(
+                int(target / self.stream.time_base), stream=self.stream, backward=True
+            )
+            # seek flushes the codec, but a suspended generator may still hold old decoded frames.
+            self.decoder = iter(self.container.decode(self.stream))
+        for frame in self.decoder:
+            if frame.pts is None:
+                break
+            timestamp = float(frame.pts * frame.time_base)
+            position = bisect_left(self.info.times, timestamp - 1e-8)
+            if (
+                position >= len(self.info.times)
+                or abs(self.info.times[position] - timestamp) >= 1e-8
+            ):
+                break
+            self.last_index = position
+            if position > index:
+                break
+            if position >= index - 8:
+                image = self._remember(position, display_image(frame))
+                if position == index:
+                    return image
+        # Preserve the established presentation-index fallback if a seek cannot be aligned.
+        return self._remember(index, read_frame(self.info, index))
+
+    def close(self):
+        self.decoder = None
+        if self.container is not None:
+            self.container.close()
+        self.container = self.stream = None
+        self.cache.clear()
+        self.cache_bytes = 0
+        self.last_index = -1
 
 
 def inspect_video(path: str, progress=None, cancelled=None, sample=None) -> VideoInfo:

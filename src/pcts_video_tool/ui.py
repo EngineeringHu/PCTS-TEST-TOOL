@@ -66,7 +66,7 @@ from .models import (
 from .motion import MotionTracker, motion_preview
 from .run_logs import export_diagnostics, log_directory, logger
 from .touch import ContactTracker
-from .video import crop, inspect_video, rate_summary, read_frame
+from .video import FrameReader, crop, inspect_video, rate_summary, read_frame
 
 REGIONS = {"flash": "灯光区域", "green": "变绿文字", "reading": "MD / TX", "touch": "触摸观察区域"}
 PRESS_MODES = {
@@ -391,6 +391,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PCTS Video Tool {__version__} · 触屏耗时测量")
         self.resize(1440, 960)
         self.session = None
+        self.frame_reader = None
         self.worker = None
         self.current_frame = -1
         self.dirty = False
@@ -725,6 +726,9 @@ class MainWindow(QMainWindow):
     def accept_session(self, session):
         self.editing = True
         self.return_full_view()
+        if self.frame_reader is not None:
+            self.frame_reader.close()
+        self.frame_reader = FrameReader(session.video)
         self.session = session
         self.canvas.reset_selection()
         self.canvas.rois = session.rois
@@ -763,14 +767,27 @@ class MainWindow(QMainWindow):
         if self.session is None or not -1 <= index < len(self.session.video.times):
             return
         self.seek_timer.stop()
-        image = None
+        three_frames = (
+            self.comparison_field is not None
+            and self.video_views.currentWidget() is self.comparison
+        )
+        pictures = {}
         if index >= 0:
-            try:
-                image = read_frame(self.session.video, index)
-            except (OSError, ValueError) as error:
-                self.show_frame(-1)
-                self.error(str(error))
-                return
+            indices = (
+                range(max(0, index - 1), min(len(self.session.video.times), index + 2))
+                if three_frames
+                else (index,)
+            )
+            for neighbor in indices:
+                try:
+                    pictures[neighbor] = self.frame_reader.read(neighbor)
+                except (OSError, ValueError) as error:
+                    if neighbor == index:
+                        self.show_frame(-1)
+                        self.error(str(error))
+                        return
+                    logger.warning("对照帧%d读取失败：%s", neighbor, error)
+        image = pictures.get(index)
         self.current_frame = index
         if image is None:
             self.canvas.clear_image("未指定帧\n请用下方导航定位")
@@ -790,10 +807,7 @@ class MainWindow(QMainWindow):
                     )
             self.review_hint.setText(hint)
             self.review_hint.setVisible(bool(hint))
-        if (
-            self.comparison_field is not None
-            and self.video_views.currentWidget() is self.comparison
-        ):
+        if three_frames:
             name = self.comparison_field
             region = REVIEW_REGIONS[name]
             roi = self.session.rois.get(region) if self.comparison.crop_only.isChecked() else None
@@ -813,10 +827,8 @@ class MainWindow(QMainWindow):
                     )
                     self.comparison.set_panel(position, None, None, message)
                     continue
-                try:
-                    picture = image if offset == 0 else read_frame(self.session.video, neighbor)
-                except (OSError, ValueError) as error:
-                    logger.warning("对照帧%d读取失败：%s", neighbor, error)
+                picture = pictures.get(neighbor)
+                if picture is None:
                     self.comparison.set_panel(position, neighbor, None, "该帧读取失败")
                     continue
                 if roi:
@@ -1552,6 +1564,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.may_replace():
+            if self.frame_reader is not None:
+                self.frame_reader.close()
             event.accept()
         else:
             event.ignore()

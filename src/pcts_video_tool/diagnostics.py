@@ -117,9 +117,22 @@ def self_test(output: str) -> int:
 
             with ZipFile(template_result) as archive:
                 ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                relationship = (
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                )
+                workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+                worksheet = next(
+                    s for s in workbook.find(ns + "sheets") if s.get("name") == "T1 (2)"
+                )
+                relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+                location = next(
+                    r.get("Target")
+                    for r in relationships
+                    if r.get("Id") == worksheet.get(relationship)
+                )
+                location = location.lstrip("/") if location.startswith("/") else "xl/" + location
                 cells = {
-                    c.get("r"): c
-                    for c in ET.fromstring(archive.read("xl/worksheets/sheet2.xml")).iter(ns + "c")
+                    c.get("r"): c for c in ET.fromstring(archive.read(location)).iter(ns + "c")
                 }
                 if (
                     cells["A6"].find(ns + "v").text != "0"
@@ -188,12 +201,21 @@ def self_test(output: str) -> int:
             if window.comparison.frame_indices != [0, 1, 2]:
                 raise ValueError("切回三帧模式未保留浏览帧")
             report["checks"].append("复核导航：显示模式跨单元格保留，缺失press辅助定位不写入测量值")
+            reader = window.frame_reader
+            if (
+                not np.array_equal(reader.read(2), read_frame(info, 2))
+                or reader.cache_bytes > reader.max_bytes
+            ):
+                raise ValueError("浏览帧缓存的像素或容量检查失败")
             window.show()
             app.processEvents()
             if window.grab().isNull():
                 raise ValueError("界面渲染自检失败")
             window.dirty = False
             window.close()
+            if reader.container is not None or reader.cache_bytes:
+                raise ValueError("关闭窗口后浏览解码器未释放")
+            report["checks"].append("浏览性能：复用原帧缓存，像素保持一致，关闭后释放读取器")
             report["checks"].append("Qt：主界面、视频预览和离屏渲染可用")
         report["ok"] = True
     except Exception:  # One diagnostic entry boundary must preserve the failure in the report.
