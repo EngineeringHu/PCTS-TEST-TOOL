@@ -37,12 +37,13 @@ class FeatureExtractor:
 class TextColorTracker:
     """Match this recording's letter shape, not the color of its animated background."""
 
-    def __init__(self, reference: np.ndarray, roi: list[float]):
-        patch = crop(reference, roi)
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        black = (hsv[:, :, 2] < 110).astype(np.uint8) * 255
-        green = cv2.inRange(hsv, (35, 65, 35), (90, 255, 255))
-        ink = black if 0.02 < np.mean(black > 0) < 0.6 else green
+    def __init__(self, reference: np.ndarray, roi: list[float], *, gray_ink=None):
+        ink = gray_ink
+        if ink is None:
+            hsv = cv2.cvtColor(crop(reference, roi), cv2.COLOR_BGR2HSV)
+            black = (hsv[:, :, 2] < 110).astype(np.uint8) * 255
+            green = cv2.inRange(hsv, (35, 65, 35), (90, 255, 255))
+            ink = black if 0.02 < np.mean(black > 0) < 0.6 else green
         if not 0.02 < np.mean(ink > 0) < 0.75:
             raise ValueError("文字区缺少可用字形参考，请让有效起帧包含清晰的PRESS HERE")
         x, y, w, h = cv2.boundingRect(ink)
@@ -62,6 +63,32 @@ class TextColorTracker:
             if template.shape[0] <= search.shape[0] and template.shape[1] <= search.shape[1]:
                 self.templates.append((scale, template))
         self.last_matches = {}
+
+    @classmethod
+    def from_gray_reference(cls, reference, roi):
+        """Try Otsu only for a dark-on-light word whose fixed mask lost most of its ink."""
+        hsv = cv2.cvtColor(crop(reference, roi), cv2.COLOR_BGR2HSV)
+        value = hsv[:, :, 2]
+        threshold, ink = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        pixels = cv2.countNonZero(ink)
+        if threshold <= 110 or not 0.02 < pixels / ink.size < 0.6:
+            return None
+        fixed_pixels = int(np.count_nonzero(value < 110))
+        if 2 * fixed_pixels >= pixels:
+            return None
+        # A green reference is already handled by the ordinary color template.
+        if np.mean(cv2.inRange(hsv, (35, 65, 35), (90, 255, 255))[ink > 0] > 0) >= 0.5:
+            return None
+        _, _, width, height = cv2.boundingRect(ink)
+        if width < 20 or height < 8:
+            return None
+        tracker = cls(reference, roi, gray_ink=ink)
+        tracker.gray_reference = {
+            "threshold": threshold,
+            "fixed_ink_pixels": fixed_pixels,
+            "adaptive_ink_pixels": pixels,
+        }
+        return tracker
 
     def __call__(self, image: np.ndarray) -> tuple[float, float]:
         self.last_matches = self.match(image)
@@ -254,12 +281,13 @@ def detect_rounds(
     fps: float = 240.0,
     start_frame: int = 0,
     stop_frame: int | None = None,
+    *,
+    strict_pairs: bool = False,
 ) -> Detections:
-    brightness, color = np.asarray(light), np.asarray(green)
-    stop_frame = len(color) if stop_frame is None else stop_frame
-    notes = []
-    # Follow the illuminated level only while on; retain one-frame dark pulses.
+    stop_frame = len(green) if stop_frame is None else stop_frame
     follow = max(2, round(fps * 0.05))
+    brightness = np.asarray(light)
+    # Follow the illuminated level only while on; retain one-frame dark pulses.
     level = float(brightness[start_frame])
     armed, bright_count = False, 0
     offs = []
@@ -276,6 +304,17 @@ def detect_rounds(
             bright_count += 1
             if bright_count >= 2:
                 armed = True
+    return pair_responses(
+        offs, green, black, fps, start_frame, stop_frame, strict_pairs=strict_pairs
+    )
+
+
+def pair_responses(
+    offs, green, black, fps, start_frame, stop_frame, *, strict_pairs=False
+) -> Detections:
+    """Match confirmed green transitions to the measured flash edges in this interval."""
+    color = np.asarray(green)
+    notes = []
     if not offs:
         notes.append("未找到显著的灯光下降沿，请检查灯光选区")
 
@@ -286,7 +325,7 @@ def detect_rounds(
     confirm = max(2, round(fps * 0.025))
     reset = max(3, round(fps * 0.05))
     greens = []
-    ready = bool(black_state[start_frame])
+    ready = not strict_pairs and bool(black_state[start_frame])
     active = None
     green_count, black_count = 0, 0
     green_start, green_gap = None, 0
@@ -335,7 +374,7 @@ def detect_rounds(
     for start, end in greens:
         candidates = [i for i in offs if previous <= i <= start]
         previous = end
-        if not candidates:
+        if not candidates or (strict_pairs and (len(candidates) != 2 or candidates[-1] == start)):
             orphan_greens.append(start)
             continue
         proof = evidence[start]
@@ -382,7 +421,7 @@ def detect_rounds(
         "thresholds": {
             "sampling_fps": fps,
             "flash_method": "adaptive_on_level_drop",
-            "flash_follow_frames": follow,
+            "flash_follow_frames": max(2, round(fps * 0.05)),
             "flash_min_drop": 8.0,
             "flash_drop_fraction": 0.05,
             "text_min_match": 0.25,

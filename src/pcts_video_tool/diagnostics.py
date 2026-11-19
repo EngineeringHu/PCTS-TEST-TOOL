@@ -86,6 +86,14 @@ def self_test(output: str) -> int:
         if refined["candidate_frame"] != 7 or refined["confirmed_at"] != 12:
             raise ValueError("green笔画首帧回溯自检失败")
         report["checks"].append("green：字形对齐、亮绿笔画与首帧回溯可用")
+        gray_text = np.maximum(black_text, 145)
+        area = [0, 0, 1, 0, 1, 1, 0, 1]
+        gray_tracker = TextColorTracker.from_gray_reference(gray_text, area)
+        if gray_tracker is None or gray_tracker(green_text)[0] < 0.25:
+            raise ValueError("灰字备用模板未能匹配绿色响应")
+        if TextColorTracker.from_gray_reference(black_text, area) is not None:
+            raise ValueError("清晰黑字误触发灰字模板")
+        report["checks"].append("灰字恢复：备用模板匹配变绿响应，清晰黑字跳过备用匹配")
         with tempfile.TemporaryDirectory(prefix="pcts-self-test-") as directory:
             video = Path(directory) / "video.nut"
             with av.open(str(video), "w") as container:

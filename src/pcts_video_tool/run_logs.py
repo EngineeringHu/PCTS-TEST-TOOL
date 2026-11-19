@@ -58,6 +58,8 @@ def export_diagnostics(session: Session | None, path: Path) -> None:
                     "input.session.json",
                     "result.session.json",
                     "signals.csv",
+                    "gray-signals.csv",
+                    "gray-template.png",
                     "detection.json",
                     "green-refinement.jsonl",
                     "text-template.png",

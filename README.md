@@ -1,4 +1,6 @@
-# PCTS Video Tool 0.6.4rc3
+# PCTS Video Tool 0.6.4rc4
+
+灰字恢复：当有效区间内出现多组未配对灭灯时，程序可在缺失区间尝试自适应文字模板。正常识别完成时只执行原有扫描。如果参考帧能够提取清晰的灰字模板，但固定阈值提不出可用字形，则直接以备用模板扫描一次。补回的轮次须有黑字复位、两次灭灯和持续变绿的证据。
 
 点击 VIDEO MEASUREMENT 标题旁的绿色“操作指引”查看当前步骤。拍摄时固定机位和被测手机，每一轮都点击屏幕上的同一位置。框选阶段提供四张带选框的参考图，分析完成后提供颜色、右键确认和双击编辑的简要说明。“检测记录”页保留分析说明、视频警告与诊断日志位置。原片帧号可在加大的数字框内直接输入。
 
@@ -37,11 +39,11 @@
 
 ## Windows 成品使用
 
-本次试用包为 `dist/PCTSVideoTool-0.6.4rc3-windows-x64.zip`。解压后运行 `PCTSVideoTool.exe`。
+本次试用包为 `dist/PCTSVideoTool-0.6.4rc4-windows-x64.zip`。解压后运行 `PCTSVideoTool.exe`。
 
 0.6.2增加导入时辅助选帧与区域默认框选方式。0.6.1已优化切换单元格和逐帧浏览：复用视频解码器、按顺序读取相邻三帧，并缓存近期原片画面。保留全部按键步数、原分辨率及已有复核行为，分析和导出算法未变。继续支持0.6.0的模板Excel导出；已有任务直接打开即可。
 
-可直接运行 **`dist/PCTSVideoTool-0.6.4rc3.exe`**，也可使用上面的 ZIP。这是Windows x64单文件程序，包含Python运行时、视频解码依赖、OCR和手部模型；使用者不需要安装WSL、Wine、Python或模型，也不需要大模型账号。
+可直接运行 **`dist/PCTSVideoTool-0.6.4rc4.exe`**，也可使用上面的 ZIP。这是Windows x64单文件程序，包含Python运行时、视频解码依赖、OCR和手部模型；使用者不需要安装WSL、Wine、Python或模型，也不需要大模型账号。
 
 单文件启动时会解压内置依赖，请等待窗口出现。成品已在实际Windows上通过OCR、手部模型、视频解码、Qt离屏与Windows窗口后端自检。真实录像识别精度和触摸自动确认的限制仍按上文说明，不因打包成功而视为已完成算法验收。
 
@@ -122,6 +124,7 @@ Windows日志默认位于 `%LOCALAPPDATA%\PCTSVideoTool\diagnostics`，无需先
 - `signals.csv`：有效区间内每帧的原片索引、时间戳、灯光平均亮度、黑/绿字形匹配分数、位置与缩放，以及原始绿色/黑色比例。
 - `text-template.png` / `text-tracking.json`：本次视频提取的二值字形参考、参考帧、选区、搜索区域与缩放范围。
 - `detection.json`：检测阈值、全部灭灯/变绿候选、最终配对及未配对事件。
+- 灰字补扫时额外记录 `gray-template.png`（备用字形）与 `gray-signals.csv`（补扫帧的匹配分数）；`detection.json` 中的 `gray_recovery` 记录原轮数、补回帧、扫描范围和耗时。
 - `green-refinement.jsonl`：黑字参考帧、稳定笔画、逐帧位置对齐、亮绿/暗色比例、分区支持、邻域色差和最终选择；`detection.json`同时保留粗检及细化来源。
 - `marker.json` / `marker-checks.jsonl`：PRESS HERE识别文字、评分、帧号、起止结果和判断依据；逐次检查记录在取消或出错时也保留。
 - `ocr-checks.jsonl`：每次MD/TX初读与补读的轮次、原帧号、时间戳、OCR原文、分数、格式是否合法及解析数值；逐次写入，取消也保留。

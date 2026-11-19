@@ -45,6 +45,12 @@ def test_full_pipeline_uses_local_models_and_exports_evidence(
     original_read = analysis.read_numbers
     calls = 0
 
+    def unexpected_recovery(*args):
+        pytest.fail("正常录像不应启动备用模板或第二次字形扫描")
+
+    monkeypatch.setattr(analysis, "recover_gray_rounds", unexpected_recovery)
+    monkeypatch.setattr(TextColorTracker, "from_gray_reference", unexpected_recovery)
+
     def one_bad_seed(engine, image):
         nonlocal calls
         calls += 1

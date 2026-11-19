@@ -17,6 +17,7 @@ import cv2
 
 from . import __version__
 from .detection import FeatureExtractor, TextColorTracker, detect_rounds, refine_green_start
+from .gray_recovery import ManualRoundMismatch, recover_gray_rounds, retain_manual_fields
 from .green_recommendation import MIN_LEAD_FRAMES, GreenOnsetProbe, interior_glyph
 from .marker import TestWindow, find_test_window
 from .models import Event, GreenRecommendation, Session, check_source, save_session
@@ -68,6 +69,8 @@ def analyze(
                     "本次轮次与已人工确认的 green 无法逐轮对应，已保留原任务。可重新导入原片建立独立分析。"
                 )
         except Exception as error:
+            if isinstance(error, ManualRoundMismatch):
+                session.diagnostic_dir = previous_directory
             (directory / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
             (directory / "status.json").write_text(
                 json.dumps(
@@ -228,7 +231,18 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
         ),
         default=window.start,
     )
-    tracker = TextColorTracker(read_frame(result.video, reference_frame), result.rois["green"])
+    reference = read_frame(result.video, reference_frame)
+    direct_gray = False
+    try:
+        tracker = TextColorTracker(reference, result.rois["green"])
+    except ValueError:
+        if not window.confirmed:
+            raise
+        tracker = TextColorTracker.from_gray_reference(reference, result.rois["green"])
+        if tracker is None:
+            raise
+        direct_gray = True
+    del reference
     ok, encoded = cv2.imencode(".png", tracker.glyph)
     if ok:
         (directory / "text-template.png").write_bytes(encoded.tobytes())
@@ -294,16 +308,49 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                     progress(
                         f"扫描有效片段：{index - window.start + 1}/{window.end - window.start + 1}帧"
                     )
-    detected = detect_rounds(
-        lights, greens, blacks, sampling_fps(result.video), window.start, window.end + 1
-    )
+    detection_fps = sampling_fps(result.video)
+    args = (lights, greens, blacks, detection_fps, window.start, window.end + 1)
+    detected = detect_rounds(*args, strict_pairs=True) if direct_gray else detect_rounds(*args)
+    gray_tracker, recovered_poses = None, {}
+    fixed_touch_starts = {}
+    if direct_gray:
+        detected.notes.append("原参考帧无法提取固定字形，已使用灰字模板并要求双灭灯配对。")
+        detected.diagnostics["gray_recovery"] = {
+            "initial_template": "gray",
+            "reference": tracker.gray_reference,
+            "extra_scan_frames": 0,
+        }
+    elif (
+        window.confirmed
+        and len(detected.rounds) < session.expected_rounds
+        and len(detected.diagnostics["unmatched_flash_frames"]) >= 4
+    ):
+        # Retain the touch search windows of previously paired responses.
+        previous = window.start
+        for start, end in detected.diagnostics["green_segments"]:
+            fixed_touch_starts[start] = previous
+            previous = end
+        gray_tracker, recovered_poses = recover_gray_rounds(
+            detected,
+            result.video,
+            result.rois["green"],
+            reference_frame,
+            window,
+            detection_fps,
+            directory,
+            progress,
+            cancelled,
+        )
     (directory / "detection.json").write_text(
         json.dumps(detected.diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     result.rounds = detected.rounds
     result.analysis_notes.extend(detected.notes)
     percentage(45)
+    gray_attempted = gray_tracker is not None or direct_gray
     if not result.rounds:
+        if gray_attempted and session.rounds:
+            retain_manual_fields(session.rounds, result.rounds, window.start)
         return result
     progress("准备原图触摸轮廓与读数…" if contact else "寻找每轮指腹，估计接近方向…")
     if result.press_mode == "auto":
@@ -312,12 +359,12 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
         except (ImportError, FileNotFoundError, RuntimeError, ValueError) as error:
             logger.exception("手部模型初始化失败")
             result.analysis_notes.append(f"手部识别未启用：{error}")
-    detection_fps = sampling_fps(result.video)
     ocr_at = {}
     windows = []
     probes = {}
     earlier_greens = {}
     glyph = interior_glyph(tracker.glyph)
+    gray_glyph = interior_glyph(gray_tracker.glyph) if recovered_poses else None
     manual_greens = {}
     for r, (item, end) in enumerate(zip(result.rounds, detected.green_ends)):
         blink = item.blink2.frame
@@ -332,7 +379,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             and old.green.frame is not None
             and item.blink1.frame <= old.green.frame < next_start
         ]
-        if len(previous) == 1:
+        if len(previous) == 1 and not gray_attempted:
             manual_greens[r] = previous[0]
         if (
             blink is not None
@@ -340,13 +387,18 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             and item.green.frame - blink > MIN_LEAD_FRAMES
             and r not in manual_greens
         ):
-            anchor = max(
-                range(max(window.start, blink - 9), blink + 1),
-                key=lambda i: blacks[i] - greens[i],
-            )
-            probes[r] = GreenOnsetProbe(
-                glyph, black_poses[anchor - window.start], blink, item.green.frame
-            )
+            if item.green.frame in recovered_poses:
+                probes[r] = GreenOnsetProbe(
+                    gray_glyph, recovered_poses[item.green.frame], blink, item.green.frame
+                )
+            else:
+                anchor = max(
+                    range(max(window.start, blink - 9), blink + 1),
+                    key=lambda i: blacks[i] - greens[i],
+                )
+                probes[r] = GreenOnsetProbe(
+                    glyph, black_poses[anchor - window.start], blink, item.green.frame
+                )
         if item.green.frame is not None:
             start = item.green.frame
             # Read only inside this green segment; never borrow a following round's values.
@@ -358,6 +410,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                 [window.start]
                 + [b for a, b in detected.diagnostics["green_segments"] if a < item.green.frame]
             )
+            previous_end = fixed_touch_starts.get(item.green.frame, previous_end)
             stop = (
                 min(end - 1, item.blink1.frame + max(3, round(detection_fps * 0.05)))
                 if contact
@@ -404,6 +457,10 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     readings = [[] for _ in result.rounds]
     touch_samples = [[] for _ in result.rounds]
     touch_decisions = []
+    # A rescued round can overlap an original round's retained touch window.
+    separate_contacts = (
+        {r: copy.copy(contact) for _, _, r in windows} if contact and recovered_poses else {}
+    )
     probe_seconds = 0.0
     probe_frames = extra_display_frames = 0
     with (
@@ -495,10 +552,11 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                         readings[r].append((i, *reading))
                         record_reading(r, i, "seed", reading)
                 if active and contact:
-                    if any(i == start for start, _, _ in windows):
-                        contact.previous_center = contact.reference_center.copy()
-                    sample = contact.measure(i, image)
                     for r in active:
+                        finger = separate_contacts.get(r, contact)
+                        if any(i == start and number == r for start, _, number in windows):
+                            finger.previous_center = finger.reference_center.copy()
+                        sample = finger.measure(i, image)
                         touch_samples[r].append(sample)
                         touch_writer.writerow(
                             {"round": r + 1, "method": "calibrated_contour", **asdict(sample)}
@@ -630,7 +688,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
 
             if item.green.state == "review":
                 refinement = refine_green_start(
-                    tracker,
+                    gray_tracker if coarse in recovered_poses else tracker,
                     reader.read,
                     proofs[coarse],
                     detection_fps,
@@ -698,6 +756,12 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
         f"green推荐检查：{probe_frames}帧，其中额外转图{extra_display_frames}帧，"
         f"笔画检查与额外转图共{probe_seconds:.2f}秒"
     )
+    if gray_attempted and session.rounds:
+        retain_manual_fields(session.rounds, result.rounds, window.start)
+        for item, row in zip(result.rounds, detected.diagnostics["round_candidates"]):
+            if item.green.state == "manual":
+                row["retained_manual_green"] = item.green.frame
+                row.pop("recommended_green", None)
     (directory / "detection.json").write_text(
         json.dumps(detected.diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
