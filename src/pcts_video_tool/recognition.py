@@ -142,6 +142,8 @@ def supplement_reading(
     cancelled=lambda: False,
     progress=lambda frame, count: None,
     frame_step: int = 10,
+    *,
+    prefetch=None,
 ) -> None:
     """Check both sides of failed seed frames, strictly inside this round."""
     choose_reading(item, readings)
@@ -156,7 +158,17 @@ def supplement_reading(
     # If nearby frames share the same obstruction, cover other times in this round.
     stride = max(frame_step, (stop - start + 17) // 18)
     batches.extend([frame] for frame in range(start + stride, stop, stride))
-    for batch in batches:
+    for index, batch in enumerate(batches):
+        # Read a small group of crops in video order. OCR still votes in the
+        # original batch order and can stop after any batch.
+        if prefetch is not None and index % 6 == 0:
+            upcoming = {
+                f
+                for pair in batches[index : index + 6]
+                for f in pair
+                if start <= f < stop and f not in seen
+            }
+            prefetch(sorted(upcoming))
         for frame in batch:
             if not start <= frame < stop or frame in seen:
                 continue

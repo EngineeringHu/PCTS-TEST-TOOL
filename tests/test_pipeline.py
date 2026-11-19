@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 
 from pcts_video_tool.analysis import analyze
+from pcts_video_tool.detection import TextColorTracker
 from pcts_video_tool.exporting import export_report
 from pcts_video_tool.models import Session, TouchCalibration, normalize_roi
 from pcts_video_tool.run_logs import export_diagnostics
-from pcts_video_tool.video import inspect_video
+from pcts_video_tool.video import inspect_video, read_frame
 
 
 def delayed_first_green(detector, *, conflict=False):
@@ -94,6 +95,15 @@ def test_full_pipeline_uses_local_models_and_exports_evidence(
         signals = list(csv.DictReader(stream))
     assert len(signals) == 1000 and signals[-1]["frame"] == "999"
     assert float(signals[50]["green_ratio"]) > 0
+    serial = TextColorTracker(read_frame(result.video, 0), rois["green"])
+    for index in (0, 49, 50, 51, 79, 80, 998, 999):
+        row = signals[index]
+        assert int(row["frame"]) == index
+        serial(read_frame(result.video, index))
+        for color, match in serial.last_matches.items():
+            assert float(row[f"{color}_shape_score"]) == match["score"]
+            assert (int(row[f"{color}_x"]), int(row[f"{color}_y"])) == match["position"]
+            assert float(row[f"{color}_scale"]) == match["scale"]
     for i, item in enumerate(result.rounds):
         assert item.last_green_frame == i * 100 + 79
         assert (item.blink1.frame, item.blink2.frame, item.green.frame) == (

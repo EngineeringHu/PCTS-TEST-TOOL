@@ -51,7 +51,7 @@ def read_frame(info: VideoInfo, index: int) -> np.ndarray:
 
 
 class FrameReader:
-    """UI-owned exact-frame reader; bounded raw-image cache, no sampling or background work."""
+    """Exact-frame reader with its own decoder and a bounded raw-image cache."""
 
     def __init__(self, info: VideoInfo, max_bytes: int = 96 * 1024 * 1024):
         self.info = info

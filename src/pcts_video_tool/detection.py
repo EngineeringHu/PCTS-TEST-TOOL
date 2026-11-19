@@ -64,10 +64,15 @@ class TextColorTracker:
         self.last_matches = {}
 
     def __call__(self, image: np.ndarray) -> tuple[float, float]:
+        self.last_matches = self.match(image)
+        return self.last_matches["green"]["score"], self.last_matches["black"]["score"]
+
+    def match(self, image: np.ndarray) -> dict:
+        """Match one frame using the read-only templates; poses belong to this frame."""
         hsv = cv2.cvtColor(crop(image, self.search_roi), cv2.COLOR_BGR2HSV)
         green = cv2.inRange(hsv, (35, 65, 35), (90, 255, 255))
         black = ((hsv[:, :, 2] < 110) & (green == 0)).astype(np.uint8) * 255
-        scores = []
+        matches = {}
         for name, mask in (("green", green), ("black", black)):
             best = (-1.0, 1.0, (0, 0))
             for scale, template in self.templates:
@@ -76,9 +81,8 @@ class TextColorTracker:
                 )
                 if score > best[0]:
                     best = (score, scale, position)
-            self.last_matches[name] = {"score": best[0], "scale": best[1], "position": best[2]}
-            scores.append(best[0])
-        return scores[0], scores[1]
+            matches[name] = {"score": best[0], "scale": best[1], "position": best[2]}
+        return matches
 
 
 def refine_green_start(

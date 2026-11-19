@@ -109,6 +109,33 @@ def test_search_covers_other_times_in_round_after_nearby_frames_fail():
     assert len(visited) <= 48
 
 
+@pytest.mark.parametrize("conflict", [False, True])
+def test_sorted_prefetch_preserves_ocr_order_early_stop_and_votes(conflict):
+    seeds = [(f, "", None, 0.0) for f in (22, 46, 63)]
+
+    def reading(frame):
+        md = 90.0 if conflict and frame == 21 else 91.0
+        return f"MD:{md} TX:0.7", (md, 0.7), 0.99
+
+    expected, expected_reads = Round(), seeds.copy()
+    supplement_reading(expected, expected_reads, 12, 77, reading)
+    assert expected.reading_state == ("review" if conflict else "auto")
+
+    crops = {}
+
+    def prefetch(frames):
+        assert frames == sorted(set(frames))
+        assert all(12 <= f < 77 for f in frames)
+        crops.clear()
+        crops.update((frame, frame) for frame in frames)
+
+    actual, actual_reads = Round(), seeds.copy()
+    supplement_reading(
+        actual, actual_reads, 12, 77, lambda f: reading(crops.pop(f)), prefetch=prefetch
+    )
+    assert (actual, actual_reads) == (expected, expected_reads)
+
+
 def test_neighbor_search_cancellation_keeps_collected_evidence():
     item = Round()
     readings = [(f, "", None, 0.0) for f in (5, 10, 15)]

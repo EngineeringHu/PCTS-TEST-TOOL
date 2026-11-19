@@ -4,6 +4,9 @@ import copy
 import csv
 import json
 import traceback
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +30,7 @@ from .recognition import (
 )
 from .run_logs import log_directory, logger
 from .touch import ContactTracker, TouchSample, locate_contact
-from .video import crop, display_image, read_frame, sampling_fps
+from .video import FrameReader, crop, display_image, read_frame, sampling_fps
 
 
 def analyze(
@@ -90,6 +93,28 @@ def analyze(
         logger.info("分析完成 rounds=%s diagnostic_dir=%s", len(result.rounds), directory)
         percentage(100)
         return result
+
+
+def _scan_signals(video, window, extract, tracker, cancelled):
+    def measure(image):
+        return extract(image), tracker.match(image)
+
+    # Decode in presentation order. Only independent pixel measurements run in parallel.
+    with av.open(video.path) as container, ThreadPoolExecutor(max_workers=2) as pool:
+        container.streams.video[0].thread_type = "AUTO"
+        pending = deque()
+        for index, frame in enumerate(container.decode(video=0)):
+            if cancelled():
+                raise InterruptedError("已取消")
+            if index > window.end:
+                break
+            if index >= window.start:
+                pending.append((index, pool.submit(measure, display_image(frame))))
+                if len(pending) >= 3:
+                    first, job = pending.popleft()
+                    yield first, *job.result()
+        for index, job in pending:
+            yield index, *job.result()
 
 
 def _analyze(session: Session, progress, cancelled, directory: Path, percentage) -> Session:
@@ -229,22 +254,13 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                 "black_scale",
             ]
         )
-        with av.open(result.video.path) as container:
-            container.streams.video[0].thread_type = "AUTO"
-            for index, frame in enumerate(container.decode(video=0)):
-                if cancelled():
-                    raise InterruptedError("已取消")
-                if index > window.end:
-                    break
-                if index < window.start:
-                    continue
-                image = display_image(frame)
-                light, green_ratio, black_ratio = extract(image)
-                green, black = tracker(image)
+        with closing(_scan_signals(result.video, window, extract, tracker, cancelled)) as scan:
+            for index, (light, green_ratio, black_ratio), matches in scan:
+                gm, bm = matches["green"], matches["black"]
+                green, black = gm["score"], bm["score"]
                 lights.append(light)
                 greens.append(green)
                 blacks.append(black)
-                gm, bm = tracker.last_matches["green"], tracker.last_matches["black"]
                 signals.writerow(
                     [
                         index,
@@ -309,11 +325,14 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     motion_trackers, targets, motion_decisions, patches = {}, {}, {}, {}
     if not contact:
         try:
-            with (directory / "touch-targets.jsonl").open("w", encoding="utf-8") as target_log:
+            with (
+                (directory / "touch-targets.jsonl").open("w", encoding="utf-8") as target_log,
+                closing(FrameReader(result.video)) as reader,
+            ):
                 for index, (start, stop, r) in enumerate(windows):
                     progress(f"寻找指腹样本：第{r + 1}/{len(result.rounds)}轮")
                     tracker_for_round, anchor, report = prepare_motion_tracker(
-                        lambda frame: read_frame(result.video, frame),
+                        reader.read,
                         result.rois["touch"],
                         start,
                         stop,
@@ -346,6 +365,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     with (
         (directory / "ocr-checks.jsonl").open("w", encoding="utf-8") as reading_log,
         (directory / "touch-signals.csv").open("w", encoding="utf-8", newline="") as touch_log,
+        closing(FrameReader(result.video)) as reader,
     ):
         touch_writer = csv.DictWriter(
             touch_log,
@@ -450,15 +470,31 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                     touch_log.flush()
         percentage(75)
         neighbor_step = max(1, round(sampling_fps(result.video) / 24))
+        reading_crops = {}
+
+        def prefetch_readings(frames):
+            reading_crops.clear()
+            for frame in frames:
+                if cancelled():
+                    raise InterruptedError("已取消")
+                try:
+                    image = reader.read(frame)
+                except (OSError, ValueError):
+                    # A later crop might never be needed. Report a read failure
+                    # only if OCR actually requests that frame.
+                    break
+                reading_crops[frame] = crop(image, result.rois["reading"])
+
         for r, item in enumerate(result.rounds):
             if cancelled():
                 raise InterruptedError("已取消")
             progress(f"核对MD/TX：第{r + 1}/{len(result.rounds)}轮")
 
             def read_at(frame, round_index=r):
-                reading = read_numbers(
-                    ocr, crop(read_frame(result.video, frame), result.rois["reading"])
-                )
+                patch = reading_crops.pop(frame, None)
+                if patch is None:
+                    patch = crop(reader.read(frame), result.rois["reading"])
+                reading = read_numbers(ocr, patch)
                 record_reading(round_index, frame, "neighbor", reading)
                 return reading
 
@@ -481,6 +517,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                     cancelled,
                     retry_progress,
                     neighbor_step,
+                    prefetch=prefetch_readings if reader.seekable else None,
                 )
             else:
                 choose_reading(item, readings[r])
@@ -507,7 +544,10 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     proofs = {row["first_green_candidate"]: row for row in detected.diagnostics["green_evidence"]}
     detected.diagnostics["coarse_green_segments"] = list(detected.diagnostics["green_segments"])
     refinements = []
-    with (directory / "green-refinement.jsonl").open("w", encoding="utf-8") as refinement_log:
+    with (
+        (directory / "green-refinement.jsonl").open("w", encoding="utf-8") as refinement_log,
+        closing(FrameReader(result.video)) as reader,
+    ):
         for r, item in enumerate(result.rounds):
             if cancelled():
                 raise InterruptedError("已取消")
@@ -528,7 +568,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             if item.green.state == "review":
                 refinement = refine_green_start(
                     tracker,
-                    lambda frame: read_frame(result.video, frame),
+                    reader.read,
                     proofs[coarse],
                     detection_fps,
                     window.start,
