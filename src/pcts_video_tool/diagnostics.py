@@ -9,9 +9,16 @@ from fractions import Fraction
 from pathlib import Path
 from zipfile import ZipFile
 
+from . import __version__
+
 
 def self_test(output: str) -> int:
-    report = {"ok": False, "frozen": bool(getattr(sys, "frozen", False)), "checks": []}
+    report = {
+        "ok": False,
+        "version": __version__,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "checks": [],
+    }
     try:
         import av
         import cv2
@@ -165,6 +172,8 @@ def self_test(output: str) -> int:
                 raise ValueError("诊断记录缺少分析用时")
             report["checks"].append("诊断：失败运行自动记录，日志与任务可导出ZIP")
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PySide6.QtCore import Qt, QTimer
+            from PySide6.QtTest import QTest
             from PySide6.QtWidgets import QApplication
 
             from .ui import MainWindow
@@ -217,6 +226,100 @@ def self_test(output: str) -> int:
                 raise ValueError("关闭窗口后浏览解码器未释放")
             report["checks"].append("浏览性能：复用原帧缓存，像素保持一致，关闭后释放读取器")
             report["checks"].append("Qt：主界面、视频预览和离屏渲染可用")
+            from .region_frames import prepare_region_session
+
+            selection_video = Path(directory) / "selection.nut"
+            with av.open(str(selection_video), "w") as container:
+                stream = container.add_stream("ffv1", rate=240)
+                stream.width, stream.height, stream.pix_fmt = 650, 240, "bgr0"
+                for i in range(6):
+                    picture = np.full((240, 650, 3), 240, np.uint8)
+                    cv2.putText(
+                        picture,
+                        "PRESS HERE",
+                        (50, 175),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.4,
+                        (0, 0, 0),
+                        3,
+                    )
+                    if i >= 2:
+                        cv2.putText(
+                            picture,
+                            "MD:88.1 TX:-0.7",
+                            (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.4,
+                            (0, 160, 0),
+                            3,
+                        )
+                    frame = av.VideoFrame.from_ndarray(picture, format="bgr24")
+                    frame.pts, frame.time_base = i, Fraction(1, 240)
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode():
+                    container.mux(packet)
+            selection, previews = prepare_region_session(
+                str(selection_video), lambda message: None, lambda: False
+            )
+            if set(previews) != {"flash", "green", "reading"} or previews["reading"][0] < 2:
+                raise ValueError("导入辅助选帧自检失败")
+            for index, picture in previews.values():
+                if not np.array_equal(picture, read_frame(selection.video, index)):
+                    raise ValueError("辅助帧与原片像素不一致")
+            report["checks"].append("辅助选帧：导入时识别文字与读数，缓存原片画面")
+            window = MainWindow()
+            window.accept_session(selection, previews)
+            window.dirty = False
+            # Supply a frame to exercise the touch selection control without inventing a hand.
+            window.region_previews["touch"] = previews["flash"]
+            for name in ("flash", "green", "reading", "touch"):
+                window.region_combo.setCurrentIndex(window.region_combo.findData(name))
+                expected_shape = "rectangle" if name == "flash" else "quad"
+                if (
+                    window.current_frame != previews[name][0]
+                    or window.canvas.shape != expected_shape
+                    or window.dirty
+                    or selection.rois
+                    or selection.rounds
+                ):
+                    raise ValueError(f"{name}辅助框选入口自检失败")
+            window.close()
+            report["checks"].append("辅助框选：四类区域跳帧、默认形状与浏览状态检查通过")
+            selection.rounds = [Round(press=Event(0), blink1=Event(1, "auto"), md=12.5, tx=-0.7)]
+            window = MainWindow()
+            window.accept_session(selection)
+            window.show()
+            window.table.setCurrentCell(0, 1)
+            window.show_frame(2)
+            app.processEvents()
+            from .ui import CELL_COLORS
+
+            if (
+                window.table.item(0, 1).background().color().name() != CELL_COLORS["review"]
+                or window.table.item(0, 2).background().color().name() != CELL_COLORS["accepted"]
+                or window.table.item(0, 3).background().color().name() != CELL_COLORS["missing"]
+            ):
+                raise ValueError("单元格状态配色自检失败")
+
+            def confirm_menu():
+                menu = app.activePopupWidget()
+                menu.setActiveAction(menu.actions()[-1])
+                QTest.keyClick(menu, Qt.Key_Return)
+
+            QTimer.singleShot(0, confirm_menu)
+            window.cell_menu(window.table.visualItemRect(window.table.item(0, 1)).center())
+            if selection.rounds[0].press != Event(2, "manual", "人工确认当前帧"):
+                raise ValueError("右键确认当前帧自检失败")
+            window.table.setCurrentCell(0, 5)
+            window.table.item(0, 5).setText("-1.2")
+            window.confirm_cell(0, 5, window.current_frame)
+            item = selection.rounds[0]
+            if item.md != -1.2 or item.reading_states != {"md": "manual", "tx": "review"}:
+                raise ValueError("单项读数编辑与独立确认自检失败")
+            window.dirty = False
+            window.close()
+            report["checks"].append("单元格复核：状态配色、右键确认当前帧、MD/TX独立编辑与确认")
         report["ok"] = True
     except Exception:  # One diagnostic entry boundary must preserve the failure in the report.
         report["error"] = traceback.format_exc()

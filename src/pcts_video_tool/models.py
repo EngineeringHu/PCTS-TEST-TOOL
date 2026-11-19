@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 EVENTS = ("press", "blink1", "blink2", "green")
+SESSION_FORMAT = 7
 METRICS = {
     "end_to_end": "端到端",
     "hu_input": "HU input",
@@ -58,6 +59,19 @@ class Round:
     reading_reason: str = "尚未识别"
     ocr_text: str = ""
     issues: list[str] = field(default_factory=list)
+    # Inclusive end of the detected green segment, used for manual navigation.
+    last_green_frame: int | None = None
+    reading_states: dict[str, str] = field(default_factory=dict)
+
+    def set_reading_state(self, name: str, state: str) -> None:
+        self.reading_states = {
+            key: self.reading_states.get(key, self.reading_state) for key in ("md", "tx")
+        }
+        self.reading_states[name] = state
+        states = set(self.reading_states.values())
+        self.reading_state = (
+            "review" if "review" in states else "auto" if states == {"auto"} else "manual"
+        )
 
     def problems(self) -> list[str]:
         problems = list(self.issues)
@@ -144,7 +158,12 @@ def calculate(session: Session, item: Round) -> dict[str, float | None]:
 def save_session(session: Session, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps({"format": 5, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps(
+            {"format": SESSION_FORMAT, **asdict(session)},
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -153,7 +172,8 @@ def save_session(session: Session, path: Path) -> None:
 def load_session(path: Path) -> Session:
     """Validate external session data once at the file boundary."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.pop("format", None) not in (1, 2, 3, 4, 5):
+    version = data.pop("format", None)
+    if version not in range(1, SESSION_FORMAT + 1):
         raise ValueError("不支持的任务文件版本")
     video = VideoInfo(**data.pop("video"))
     if not video.times or video.width <= 0 or video.height <= 0:
@@ -176,6 +196,11 @@ def load_session(path: Path) -> Session:
                 raise ValueError("未知事件状态")
             events[name] = event
         item = Round(**events, **raw)
+        if item.last_green_frame is not None and (
+            type(item.last_green_frame) is not int
+            or not 0 <= item.last_green_frame < len(video.times)
+        ):
+            raise ValueError("绿字结束帧超出原片范围")
         for value in (item.md, item.tx):
             if value is not None and (
                 not isinstance(value, (int, float)) or not math.isfinite(value)
@@ -187,6 +212,14 @@ def load_session(path: Path) -> Session:
             raise ValueError("读数来源帧超出原片范围")
         if item.reading_state not in ("auto", "manual", "review"):
             raise ValueError("未知读数状态")
+        if not isinstance(item.reading_states, dict) or any(
+            name not in ("md", "tx") or state not in ("auto", "manual", "review")
+            for name, state in item.reading_states.items()
+        ):
+            raise ValueError("未知单项读数状态")
+        if item.reading_states:
+            name = next(iter(item.reading_states))
+            item.set_reading_state(name, item.reading_states[name])
         rounds.append(item)
     raw_calibration = data.pop("touch_calibration", None)
     calibration = TouchCalibration(**raw_calibration) if raw_calibration is not None else None
@@ -222,6 +255,29 @@ def load_session(path: Path) -> Session:
             session.rois.get("touch"),
             require_line=session.press_mode == "reference",
         )
+    # Older tasks kept the exclusive end only in the run's detection report.
+    if version >= 6 or not rounds or not session.diagnostic_dir:
+        return session
+    report = Path(session.diagnostic_dir) / "detection.json"
+    packaged = {
+        "result.session.json": "detection.json",
+        "current.session.json": "analysis/detection.json",
+    }
+    if path.name in packaged and (path.parent / packaged[path.name]).is_file():
+        report = path.parent / packaged[path.name]
+    try:
+        detection = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return session
+    candidates = detection.get("round_candidates") if isinstance(detection, dict) else None
+    if isinstance(candidates, list):
+        by_blinks = {(r.blink1.frame, r.blink2.frame): r for r in rounds}
+        for candidate in candidates:
+            match candidate:
+                case {"blink1": int(first), "blink2": int(second), "green_end": int(end)}:
+                    item = by_blinks.get((first, second))
+                    if item is not None and second < end <= len(video.times):
+                        item.last_green_frame = end - 1
     return session
 
 

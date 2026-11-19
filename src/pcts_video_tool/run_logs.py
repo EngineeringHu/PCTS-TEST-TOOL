@@ -10,7 +10,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import __version__
-from .models import Session
+from .models import SESSION_FORMAT, Session
 
 logger = logging.getLogger("pcts_video_tool")
 
@@ -45,7 +45,10 @@ def export_diagnostics(session: Session | None, path: Path) -> None:
             archive.writestr(
                 "current.session.json",
                 json.dumps(
-                    {"format": 5, **asdict(session)}, ensure_ascii=False, indent=2, allow_nan=False
+                    {"format": SESSION_FORMAT, **asdict(session)},
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
                 ),
             )
             if session.diagnostic_dir:

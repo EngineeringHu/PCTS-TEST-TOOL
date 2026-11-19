@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QPolygonF,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -39,6 +41,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -64,9 +68,10 @@ from .models import (
     validate_touch_calibration,
 )
 from .motion import MotionTracker, motion_preview
+from .region_frames import prepare_region_session
 from .run_logs import export_diagnostics, log_directory, logger
 from .touch import ContactTracker
-from .video import FrameReader, crop, inspect_video, rate_summary, read_frame
+from .video import FrameReader, crop, rate_summary, read_frame
 
 REGIONS = {"flash": "灯光区域", "green": "变绿文字", "reading": "MD / TX", "touch": "触摸观察区域"}
 PRESS_MODES = {
@@ -82,6 +87,24 @@ REVIEW_REGIONS = {
     "green": "green",
     "reading": "reading",
 }
+CELL_COLORS = {"accepted": "#dcfce7", "review": "#fef3c7", "missing": "#fee2e2"}
+
+
+class ResultTable(QTableWidget):
+    def mousePressEvent(self, event):
+        # Opening a menu must preserve the frame the user is about to confirm.
+        if event.button() != Qt.RightButton:
+            super().mousePressEvent(event)
+
+
+class ResultCellDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        option = QStyleOptionViewItem(option)
+        background = index.data(Qt.BackgroundRole)
+        if background is not None:
+            option.palette.setColor(QPalette.Highlight, background.color().darker(110))
+            option.palette.setColor(QPalette.HighlightedText, QColor("#1e293b"))
+        super().paint(painter, option, index)
 
 
 class Worker(QThread):
@@ -392,6 +415,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 960)
         self.session = None
         self.frame_reader = None
+        self.region_previews = {}
         self.worker = None
         self.current_frame = -1
         self.dirty = False
@@ -434,6 +458,17 @@ class MainWindow(QMainWindow):
         lv.setContentsMargins(0, 0, 8, 0)
         rv.setContentsMargins(4, 0, 0, 0)
         self.canvas = VideoCanvas()
+        self.round_hint = QLabel()
+        self.round_hint.setWordWrap(True)
+        self.round_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.round_hint.setStyleSheet("background: #213342; color: white; padding: 8px;")
+        overlay = QVBoxLayout(self.canvas)
+        overlay.addWidget(self.round_hint, 0, Qt.AlignTop | Qt.AlignHCenter)
+        overlay.addStretch()
+        self.round_hint.hide()
+        self.round_hint_timer = QTimer(self)
+        self.round_hint_timer.setSingleShot(True)
+        self.round_hint_timer.timeout.connect(self.round_hint.hide)
         self.canvas.region_changed.connect(self.region_changed)
         self.canvas.selection_error.connect(self.statusBar().showMessage)
         self.comparison = FrameComparison()
@@ -476,6 +511,7 @@ class MainWindow(QMainWindow):
         for key, text in REGIONS.items():
             self.region_combo.addItem("框选：" + text, key)
         self.region_combo.currentIndexChanged.connect(self.select_region)
+        self.region_combo.activated.connect(self.select_region)
         roi_bar.addWidget(self.region_combo)
         self.shape_combo = QComboBox()
         self.shape_combo.addItem("四点框选（侧拍）", "quad")
@@ -575,17 +611,27 @@ class MainWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([950, 490])
         layout.addWidget(split, 3)
-        self.table = QTableWidget(0, 9)
+        self.table = ResultTable(0, 9)
         self.table.setHorizontalHeaderLabels(
             ["轮次", "press", "blink 1", "blink 2", "green", "MD", "TX", "端到端 ms", "复核状态"]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.table.setItemDelegate(ResultCellDelegate(self.table))
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.cell_menu)
+        self.table.itemChanged.connect(self.edit_table_number)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self.select_round)
         self.table.cellClicked.connect(self.review_cell)
         layout.addWidget(self.table, 2)
+        layout.addWidget(
+            QLabel(
+                "绿色 · 自动通过 / 人工确认　 黄色 · 候选待复核　 红色 · 缺失需填写"
+                "　｜　右键确认，MD / TX 双击编辑"
+            )
+        )
         footer = QHBoxLayout()
         self.summary = QLabel("尚未导入视频")
         footer.addWidget(self.summary, 1)
@@ -719,16 +765,18 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.begin(
-                lambda progress, cancel, percentage: Session(inspect_video(path, progress, cancel)),
-                self.accept_session,
+                lambda progress, cancel, percentage: prepare_region_session(path, progress, cancel),
+                lambda result: self.accept_session(*result),
             )
 
-    def accept_session(self, session):
+    def accept_session(self, session: Session, previews=None, *, saved=False):
         self.editing = True
         self.return_full_view()
+        self.region_combo.setCurrentIndex(0)
         if self.frame_reader is not None:
             self.frame_reader.close()
         self.frame_reader = FrameReader(session.video)
+        self.region_previews = previews or {}
         self.session = session
         self.canvas.reset_selection()
         self.canvas.rois = session.rois
@@ -744,11 +792,13 @@ class MainWindow(QMainWindow):
         self.method.blockSignals(False)
         self.fps.blockSignals(False)
         self.fps.setEnabled(session.method == "frames")
-        self.dirty = True
+        self.dirty = not saved
         self.roi_status.setText(f"区域 {len(session.rois)} / 4")
         self.calibration_button.setText(PRESS_MODES[session.press_mode])
         self.refresh_table()
-        self.show_frame(0)
+        self.show_frame(
+            0, preview=self.region_previews["flash"][1] if self.region_previews else None
+        )
         self.details.setPlainText("\n".join(session.analysis_notes + session.video.warnings))
         self.editing = False
         if 0 <= self.table.currentRow() < len(session.rounds):
@@ -763,9 +813,10 @@ class MainWindow(QMainWindow):
             self.editing = False
         self.statusBar().showMessage("任务已就绪。可框选区域、开始分析，或复核现有结果。")
 
-    def show_frame(self, index):
+    def show_frame(self, index, *, preview=None):
         if self.session is None or not -1 <= index < len(self.session.video.times):
             return
+        self.round_hint.hide()
         self.seek_timer.stop()
         three_frames = (
             self.comparison_field is not None
@@ -780,7 +831,11 @@ class MainWindow(QMainWindow):
             )
             for neighbor in indices:
                 try:
-                    pictures[neighbor] = self.frame_reader.read(neighbor)
+                    pictures[neighbor] = (
+                        preview
+                        if neighbor == index and preview is not None
+                        else self.frame_reader.read(neighbor)
+                    )
                 except (OSError, ValueError) as error:
                     if neighbor == index:
                         self.show_frame(-1)
@@ -932,10 +987,23 @@ class MainWindow(QMainWindow):
 
     def select_region(self):
         name = self.region_combo.currentData()
+        self.canvas.set_region(name)
         if name is not None:
             self.return_full_view()
             self.region_visibility.setChecked(True)
-        self.canvas.set_region(name)
+            shape = "rectangle" if name == "flash" else "quad"
+            self.shape_combo.setCurrentIndex(self.shape_combo.findData(shape))
+            if self.session is None:
+                return
+            if name in self.region_previews:
+                frame, image = self.region_previews[name]
+                if self.current_frame != frame or self.seek_timer.isActive():
+                    self.show_frame(frame, preview=image)
+                self.statusBar().showMessage(f"{REGIONS[name]} · 辅助帧 {frame}，可逐帧调整")
+            else:
+                if self.current_frame < 0:
+                    self.show_frame(0)
+                self.statusBar().showMessage(f"{REGIONS[name]} · 未找到合适的辅助帧，请手动选帧")
 
     def start_analysis(self):
         if self.session:
@@ -955,7 +1023,7 @@ class MainWindow(QMainWindow):
             )
 
     def accept_analysis(self, session):
-        self.accept_session(session)
+        self.accept_session(session, self.region_previews)
         if not session.rounds:
             message = "分析已结束，但未识别到有效轮次。请查看检测说明，或导出诊断包。"
             self.round_title.setText("未识别到轮次 · 检测原因如下")
@@ -986,6 +1054,7 @@ class MainWindow(QMainWindow):
         if not self.session:
             return
         selected = self.table.currentRow()
+        selected_column = self.table.currentColumn()
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.session.rounds))
         totals = []
@@ -1003,15 +1072,37 @@ class MainWindow(QMainWindow):
             ]
             for j, value in enumerate(values):
                 cell = QTableWidgetItem("—" if value is None else str(value))
-                if item.problems():
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+                if 1 <= j <= 6:
+                    if j <= 4:
+                        event = getattr(item, EVENTS[j - 1])
+                        state, reason = event.state, event.reason
+                    else:
+                        name = "md" if j == 5 else "tx"
+                        state = item.reading_states.get(name, item.reading_state)
+                        reason = item.reading_reason
+                        cell.setFlags(cell.flags() | Qt.ItemIsEditable)
+                    status = (
+                        "missing"
+                        if value is None
+                        else ("review" if state == "review" else "accepted")
+                    )
+                    label = {"auto": "自动通过", "manual": "人工确认", "review": "候选待复核"}[
+                        state
+                    ]
+                    cell.setBackground(QColor(CELL_COLORS[status]))
+                    cell.setData(
+                        Qt.UserRole, ("缺失需填写" if value is None else label) + "\n" + reason
+                    )
+                elif item.problems():
                     cell.setForeground(QColor("#9a5300"))
                 self.table.setItem(i, j, cell)
         self.update_missing_hints()
+        if 0 <= selected < len(self.session.rounds):
+            self.table.setCurrentCell(selected, max(0, selected_column))
         self.table.blockSignals(False)
         if not self.session.rounds and self.comparison_field is not None:
             self.return_full_view()
-        if 0 <= selected < len(self.session.rounds):
-            self.table.selectRow(selected)
         metadata = rate_summary(self.session.video, self.session.fps)
         if self.session.test_start is not None:
             metadata += f"\n有效片段：{self.session.test_start}～{self.session.test_end}帧（{self.session.range_mode}）"
@@ -1034,7 +1125,7 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             for column in range(self.table.columnCount()):
                 cell = self.table.item(row, column)
-                text = ""
+                text = cell.data(Qt.UserRole) or ""
                 if enabled and cell.text() == "—":
                     if column == 1:
                         text = (
@@ -1050,7 +1141,7 @@ class MainWindow(QMainWindow):
                             text += "\n耗时在补齐press和green后自动计算。"
                 cell.setToolTip(text)
 
-    def select_round(self):
+    def select_round(self, *, navigate=True):
         index = self.table.currentRow()
         if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
             return
@@ -1066,6 +1157,9 @@ class MainWindow(QMainWindow):
         self.details.setPlainText(
             "\n".join(item.problems()) + "\n\nOCR画面读数：\n" + item.ocr_text
         )
+        if not navigate:
+            self.editing = False
+            return
         frame = next(
             (getattr(item, n).frame for n in EVENTS if getattr(item, n).frame is not None), None
         )
@@ -1089,21 +1183,101 @@ class MainWindow(QMainWindow):
         if self.comparison_field == "press" and name in ("press", "blink1"):
             self.show_frame(self.current_frame)
 
-    def edit_number(self, name, text):
+    def edit_number(self, name, text, *, strict=False):
         index = self.table.currentRow()
         if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
             return
         try:
             value = float(text) if text.strip() else None
             if value is not None and not math.isfinite(value):
-                value = None
+                raise ValueError("读数必须为有限数字")
         except ValueError:
+            if strict:
+                self.statusBar().showMessage("读数请输入有限数字，可为负数或小数，也可留空")
+                self.refresh_table()
+                return
             value = None
         item = self.session.rounds[index]
         setattr(item, name, value)
-        item.reading_state, item.reading_reason = "review", "人工修改，待确认"
+        item.set_reading_state(name, "review")
+        item.reading_reason = "人工修改，待确认"
         self.dirty = True
         self.refresh_table()
+        if strict:
+            getattr(self, name).setText("" if value is None else str(value))
+
+    def edit_table_number(self, cell):
+        if cell.column() in (5, 6):
+            name = "md" if cell.column() == 5 else "tx"
+            value = getattr(self.session.rounds[cell.row()], name)
+            if cell.text() != ("—" if value is None else str(value)):
+                self.edit_number(name, cell.text(), strict=True)
+
+    def cell_menu(self, position):
+        cell = self.table.itemAt(position)
+        if self.session is None or cell is None or not 1 <= cell.column() <= 6:
+            return
+        row, column = cell.row(), cell.column()
+        item = self.session.rounds[row]
+        frame = self.current_frame
+        menu = QMenu(self.table)
+        if column <= 4:
+            candidate = getattr(item, EVENTS[column - 1]).frame
+            view = menu.addAction(
+                "尚无候选帧" if candidate is None else f"查看候选帧（{candidate}）"
+            )
+            view.setEnabled(candidate is not None)
+            confirm = menu.addAction(
+                f"确认当前帧（{frame}）" if frame >= 0 else "确认当前帧（请先显示视频画面）"
+            )
+            confirm.setEnabled(frame >= 0)
+        else:
+            view = None
+            name = "md" if column == 5 else "tx"
+            value = getattr(item, name)
+            confirm = menu.addAction(
+                f"确认 {name.upper()} 读数（{value:g} ms）"
+                if value is not None
+                else "确认读数（请先双击填写）"
+            )
+            confirm.setEnabled(value is not None)
+        action = menu.exec(self.table.viewport().mapToGlobal(position))
+        if action is None:
+            return
+        if action == confirm:
+            self.confirm_cell(row, column, frame)
+        elif action == view:
+            self.table.setCurrentCell(row, column)
+            self.review_cell(row, column)
+
+    def confirm_cell(self, row, column, frame):
+        item = self.session.rounds[row]
+        if column <= 4:
+            if frame < 0:
+                return
+            event = getattr(item, EVENTS[column - 1])
+            event.frame, event.state, event.reason = frame, "manual", "人工确认当前帧"
+        else:
+            name = "md" if column == 5 else "tx"
+            if getattr(item, name) is None:
+                return
+            item.set_reading_state(name, "manual")
+            item.reading_reason = (
+                "单项读数已人工复核" if item.reading_state != "review" else "另一读数待复核"
+            )
+            if item.reading_frame is None and frame >= 0:
+                item.reading_frame = frame
+        self.dirty = True
+        self.table.blockSignals(True)
+        self.table.setCurrentCell(row, column)
+        self.table.blockSignals(False)
+        self.refresh_table()
+        self.select_round(navigate=False)
+        if column <= 4:
+            self.review_cell(row, column)
+        elif self.comparison_field is not None:
+            self.show_frame(self.current_frame)
+        self.statusBar().showMessage("当前单元格已人工确认")
 
     def edit_reading_frame(self, value):
         index = self.table.currentRow()
@@ -1111,6 +1285,7 @@ class MainWindow(QMainWindow):
             return
         item = self.session.rounds[index]
         item.reading_frame = value if value >= 0 else None
+        item.reading_states.clear()
         item.reading_state, item.reading_reason = "review", "读数来源已修改，待确认"
         self.dirty = True
         self.refresh_table()
@@ -1158,6 +1333,7 @@ class MainWindow(QMainWindow):
             event.state = "manual" if frame >= 0 else "review"
             event.reason = "人工确认" if frame >= 0 else "尚未选定"
         item.md, item.tx = numbers
+        item.reading_states.clear()
         item.reading_frame = self.reading_frame.value() if self.reading_frame.value() >= 0 else None
         item.reading_state = "manual" if all(v is not None for v in numbers) else "review"
         item.reading_reason = "人工确认" if item.reading_state == "manual" else "读数未填全"
@@ -1167,11 +1343,32 @@ class MainWindow(QMainWindow):
         self.select_round()
 
     def add_round(self):
-        if self.session:
-            self.session.rounds.append(Round())
-            self.dirty = True
-            self.refresh_table()
-            self.table.selectRow(len(self.session.rounds) - 1)
+        if self.session is None:
+            return
+        rounds = self.session.rounds
+        start = self.session.test_start or 0
+        if rounds:
+            previous = rounds[-1]
+            frames = [getattr(previous, name).frame for name in EVENTS]
+            frames.extend((previous.reading_frame, previous.last_green_frame))
+            last = max((f for f in frames if f is not None), default=None)
+            start = max(start, self.current_frame if last is None else last + 1)
+
+        self.return_full_view()
+        self.region_combo.setCurrentIndex(0)
+        rounds.append(Round())
+        self.dirty = True
+        self.refresh_table()
+        self.table.selectRow(len(rounds) - 1)
+        frame = min(start, len(self.session.video.times) - 1)
+        self.show_frame(frame)
+        if self.current_frame == frame:
+            hint = f"已定位到第{len(rounds)}轮的查找起点（原片第{frame}帧），可逐帧观察并录入。"
+            if start > frame:
+                hint = f"上一轮已到原片末帧（第{frame}帧），请向前查找第{len(rounds)}轮。"
+            self.round_hint.setText(hint)
+            self.round_hint.show()
+            self.round_hint_timer.start(4000)
 
     def remove_round(self):
         index = self.table.currentRow()
@@ -1213,8 +1410,15 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError, TypeError, KeyError) as error:
                 self.error(f"任务无法打开：{error}")
                 return
-            self.accept_session(session)
-            self.dirty = False
+            if self.region_previews and self.session.video == session.video:
+                self.accept_session(session, self.region_previews, saved=True)
+                return
+            self.begin(
+                lambda progress, cancel, percentage: prepare_region_session(
+                    session.video.path, progress, cancel, session
+                ),
+                lambda result: self.accept_session(*result, saved=True),
+            )
 
     def export(self):
         if self.session is None:
@@ -1496,7 +1700,8 @@ class MainWindow(QMainWindow):
         mode.currentIndexChanged.connect(lambda: start.setEnabled(mode.currentData() == "manual"))
         mode.currentIndexChanged.connect(lambda: end.setEnabled(mode.currentData() == "manual"))
         info = QLabel(
-            "自动模式忽略开始前与结束后的片段；文字短暂被遮挡时不会立即结束。\n自动边界有疑问时，可在原片查看帧号后手工确认范围。"
+            "连续4次检测到 PRESS HERE 消失且文字选区中央空白时，自动确定结束帧。\n"
+            "自动边界有疑问时，可在原片查看帧号后手工确认范围。"
         )
         info.setWordWrap(True)
         layout.addRow(info)

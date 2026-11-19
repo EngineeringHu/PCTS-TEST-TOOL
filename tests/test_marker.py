@@ -10,13 +10,16 @@ from pcts_video_tool.video import inspect_video
 
 
 @pytest.fixture
-def indexed_video(tmp_path):
+def indexed_video(tmp_path, request):
     path = tmp_path / "marker-timeline.nut"
     with av.open(str(path), "w") as container:
         stream = container.add_stream("ffv1", rate=240)
         stream.width, stream.height, stream.pix_fmt = 64, 32, "bgr0"
         for i in range(900):
             image = np.full((32, 64, 3), (i % 256, i // 256, 50), np.uint8)
+            if 120 <= i < getattr(request, "param", 0):
+                image[8:24, 20:32] = (0, 210, 0)
+                image[8:24, 32:44] = (160, 30, 80)
             frame = av.VideoFrame.from_ndarray(image, format="bgr24")
             frame.pts, frame.time_base = i, Fraction(1, 240)
             for packet in stream.encode(frame):
@@ -49,6 +52,24 @@ def test_partial_text_does_not_end_test(indexed_video, monkeypatch):
     monkeypatch.setattr(marker, "read_text", recognize)
     window = marker.find_test_window(indexed_video, [0, 0, 1, 0, 1, 1, 0, 1], object())
     assert (window.start, window.end, window.confirmed) == (0, 899, True)
+
+
+@pytest.mark.parametrize(
+    "indexed_video,expected_end,confirmed",
+    [(483, 482, True), (900, 899, False)],
+    indirect=["indexed_video"],
+)
+def test_repeated_ocr_misses_require_a_blank_center(
+    indexed_video, expected_end, confirmed, monkeypatch
+):
+    def recognize(engine, image):
+        index = int(image[0, 0, 0]) + int(image[0, 0, 1]) * 256
+        return ("PRESS HERE" if index < 120 else "PRSSHER"), 0.95
+
+    monkeypatch.setattr(marker, "read_text", recognize)
+    window = marker.find_test_window(indexed_video, [0, 0, 1, 0, 1, 1, 0, 1], object())
+    assert (window.start, window.end, window.confirmed) == (0, expected_end, confirmed)
+    assert any(c["state"] == "absent" and not c["center_blank"] for c in window.checks)
 
 
 def test_no_marker_does_not_analyze_the_whole_video(indexed_video, monkeypatch):

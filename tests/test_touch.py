@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from pcts_video_tool.models import (
+    SESSION_FORMAT,
     TouchCalibration,
     load_session,
     save_session,
@@ -89,7 +90,7 @@ def test_calibration_roundtrip_old_format_and_boundary_validation(session, tmp_p
     save_session(session, path)
     assert load_session(path) == session
     raw = json.loads(path.read_text())
-    assert raw["format"] == 5
+    assert raw["format"] == SESSION_FORMAT
     raw["format"] = 3
     raw.pop("touch_calibration")
     path.write_text(json.dumps(raw))

@@ -8,6 +8,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from pcts_video_tool import analysis, ui
+from pcts_video_tool.models import load_session, save_session
 from pcts_video_tool.ui import MainWindow, Worker
 from pcts_video_tool.video import crop, inspect_video, read_frame
 
@@ -31,6 +32,43 @@ def review_window(session, generated_video):
 def click_cell(window, row, column):
     rectangle = window.table.visualItemRect(window.table.item(row, column))
     QTest.mouseClick(window.table.viewport(), Qt.LeftButton, pos=rectangle.center())
+
+
+@pytest.mark.parametrize(
+    "saved_end,legacy_report,expected", [(83, False, 84), (None, True, 84), (None, False, 66)]
+)
+def test_add_tenth_round_uses_previous_end_and_expires_hint(
+    review_window, tmp_path, saved_end, legacy_report, expected
+):
+    window = review_window
+    session = window.session
+    session.rounds = [deepcopy(session.rounds[0]) for _ in range(9)]
+    session.rounds[-1].last_green_frame = saved_end
+    path = tmp_path / "nine.session.json"
+    save_session(session, path)
+    if saved_end is None:
+        raw = json.loads(path.read_text())
+        raw["format"] = 5
+        raw["diagnostic_dir"] = str(tmp_path)
+        for row in raw["rounds"]:
+            del row["last_green_frame"]
+        path.write_text(json.dumps(raw))
+        if legacy_report:
+            (tmp_path / "detection.json").write_text(
+                json.dumps({"round_candidates": [{"blink1": 14, "blink2": 20, "green_end": 84}]})
+            )
+    window.accept_session(load_session(path))
+    click_cell(window, 0, 4)  # Adding from comparison view must still show the original video.
+    window.add_round()
+    assert window.table.currentRow() == 9 and window.frame_input.value() == expected
+    assert window.video_views.currentWidget() is window.canvas and not window.canvas.pixmap.isNull()
+    assert window.session.rounds[-1] == ui.Round()
+    assert window.round_hint.isVisible() and "第10轮" in window.round_hint.text()
+    assert window.round_hint_timer.isActive()
+    window.round_hint_timer.start(1)
+    QTest.qWait(40)
+    assert not window.round_hint.isVisible()
+    assert window.current_frame == expected
 
 
 @pytest.mark.parametrize(

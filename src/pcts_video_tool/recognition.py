@@ -107,6 +107,8 @@ def read_numbers(engine, image: np.ndarray) -> tuple[str, tuple[float, float] | 
 
 
 def choose_reading(item: Round, readings: list[tuple[int, str, tuple | None, float]]) -> None:
+    item.reading_states.clear()
+    item.reading_state = "review"
     item.ocr_text = "\n".join(f"帧{f}: {text or '(未识别)'}" for f, text, _, _ in readings)
     valid = list({row[0]: row for row in readings if row[2] is not None}.values())
     if not valid:

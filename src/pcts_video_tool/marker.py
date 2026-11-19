@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 
 import av
+import cv2
+import numpy as np
 
 from .models import VideoInfo
 from .recognition import read_text
@@ -46,9 +48,18 @@ def find_test_window(
             raise InterruptedError("已取消")
         if index not in cache:
             image = read_frame(info, index) if image is None else image
-            text, score = read_text(engine, crop(image, roi))
+            patch = crop(image, roi)
+            text, score = read_text(engine, patch)
             state = marker_state(text)
-            cache[index] = state
+            # Use the middle of the rectified screen label, away from the bezel.
+            # A blank screen can still have mild reflections and sensor noise.
+            h, w = patch.shape[:2]
+            center = patch[h // 4 : h - h // 4, w // 4 : w - w // 4]
+            sample = cv2.resize(center, (96, 48), interpolation=cv2.INTER_AREA)
+            low, high = np.percentile(sample, (5, 95), axis=(0, 1))
+            contrast = float(max(high - low))
+            center_blank = contrast <= 32
+            cache[index] = state, state == "absent" and center_blank
             checks.append(
                 {
                     "frame": index,
@@ -56,6 +67,8 @@ def find_test_window(
                     "text": text,
                     "score": score,
                     "state": state,
+                    "center_contrast": round(contrast, 2),
+                    "center_blank": center_blank,
                     "phase": phase,
                 }
             )
@@ -66,14 +79,15 @@ def find_test_window(
         # Refine the interval between sampled states using original frame indices.
         while high - low > 1:
             mid = (low + high) // 2
-            visible = check(mid, phase="refine") != "absent"
-            if visible == entering:
+            state, ended = check(mid, phase="refine")
+            crossed = state != "absent" if entering else ended
+            if crossed:
                 high = mid
             else:
                 low = mid
         return high
 
-    first, last_absent, last_visible = None, -1, None
+    first, last_absent, last_active = None, -1, None
     missing = []
     with av.open(info.path) as container:
         container.streams.video[0].thread_type = "AUTO"
@@ -84,37 +98,37 @@ def find_test_window(
                 continue
             progress(f"检查PRESS HERE起止：{index + 1}/{len(info.times)}帧")
             percentage((index + 1) * 100 // len(info.times))
-            state = check(index, display_image(frame))
+            state, ended = check(index, display_image(frame))
             if first is None:
                 if state == "present":
                     first = boundary(last_absent, index, True) if index else 0
-                    last_visible = index
+                    last_active = index
                 elif state == "absent":
                     last_absent = index
-            elif state != "absent":
+            elif not ended:
                 missing = []
-                last_visible = index
+                last_active = index
             else:
                 missing.append(index)
                 if len(missing) >= 4:
-                    vanished = boundary(last_visible, missing[0], False)
+                    vanished = boundary(last_active, missing[0], False)
                     return TestWindow(
                         first,
                         vanished - 1,
                         True,
-                        f"PRESS HERE在第{first}帧出现、第{vanished}帧消失；连续4次检查确认消失",
+                        f"PRESS HERE在第{first}帧出现，从第{vanished}帧起文字消失且中央空白，连续4次检查确认",
                         checks,
                     )
     if first is None:
         return TestWindow(
             None, None, False, "未识别到完整PRESS HERE；请检查文字选区，或使用手工有效片段", checks
         )
-    if missing:
+    if state == "absent":
         return TestWindow(
             first,
             len(info.times) - 1,
             False,
-            "视频末尾文字无法识别，但持续时间不足以确认结束；请复核或手工设置有效片段",
+            "视频末尾文字无法识别，未连续4次确认文字消失且中央空白，请复核或手工设置有效片段",
             checks,
         )
     return TestWindow(

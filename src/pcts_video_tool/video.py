@@ -11,11 +11,18 @@ import numpy as np
 from .models import VideoInfo
 
 
-def display_image(frame: av.VideoFrame) -> np.ndarray:
-    image = frame.to_ndarray(format="bgr24")
+def display_image(frame: av.VideoFrame, max_side: int | None = None) -> np.ndarray:
     rotation = int(frame.rotation)
     if rotation % 90:
         raise ValueError(f"暂不支持{rotation}度非直角旋转视频")
+    if max_side and max(frame.width, frame.height) > max_side:
+        scale = max_side / max(frame.width, frame.height)
+        frame = frame.reformat(
+            width=max(1, round(frame.width * scale)),
+            height=max(1, round(frame.height * scale)),
+            format="bgr24",
+        )
+    image = frame.to_ndarray(format="bgr24")
     return np.ascontiguousarray(np.rot90(image, rotation // 90))
 
 
@@ -119,7 +126,9 @@ class FrameReader:
         self.last_index = -1
 
 
-def inspect_video(path: str, progress=None, cancelled=None, sample=None) -> VideoInfo:
+def inspect_video(
+    path: str, progress=None, cancelled=None, sample=None, *, thumbnails=None
+) -> VideoInfo:
     times = []
     source = Path(path).resolve()
     with av.open(str(source)) as container:
@@ -130,6 +139,7 @@ def inspect_video(path: str, progress=None, cancelled=None, sample=None) -> Vide
         average = float(stream.average_rate or 0)
         nominal = float(stream.base_rate or 0)
         width, height, rotation = stream.width, stream.height, 0
+        stride = max(1, (stream.frames + 191) // 192)
         for index, frame in enumerate(container.decode(stream)):
             if cancelled and cancelled():
                 raise InterruptedError("已取消")
@@ -140,6 +150,13 @@ def inspect_video(path: str, progress=None, cancelled=None, sample=None) -> Vide
                 rotation = int(frame.rotation)
                 if sample:
                     sample(index, image)
+            if thumbnails is not None and index % stride == 0:
+                # Some containers omit the frame count. Keep sampling the entire timeline.
+                if len(thumbnails) == 192:
+                    del thumbnails[1::2]
+                    stride *= 2
+                if index % stride == 0:
+                    thumbnails.append((index, display_image(frame, max_side=384)))
             if progress and index % 120 == 0:
                 progress(f"正在逐帧读取：{index + 1} / {stream.frames or '?'}")
     if not times:

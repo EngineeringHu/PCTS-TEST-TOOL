@@ -95,6 +95,7 @@ def test_full_pipeline_uses_local_models_and_exports_evidence(
     assert len(signals) == 1000 and signals[-1]["frame"] == "999"
     assert float(signals[50]["green_ratio"]) > 0
     for i, item in enumerate(result.rounds):
+        assert item.last_green_frame == i * 100 + 79
         assert (item.blink1.frame, item.blink2.frame, item.green.frame) == (
             i * 100 + 20,
             i * 100 + 40,
@@ -162,7 +163,8 @@ def test_real_ocr_marker_excludes_intro_and_invalid_tail(generated_video, tmp_pa
             write(frame.to_ndarray(format="bgr24"))
         for i in range(240):
             tail = np.full((360, 640, 3), (0, 170, 0), np.uint8)
-            cv2.putText(tail, "HOME", (270, 83), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            # The test display is blank in the middle while unrelated content remains outside it.
+            cv2.putText(tail, "HOME", (45, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
             tail[9:81, 16:96] = 255 if i % 8 < 4 else 0
             write(tail)
         for packet in stream.encode():

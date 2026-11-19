@@ -341,7 +341,9 @@ def detect_rounds(
             if uncertain
             else "黑字变为绿字的首个匹配帧"
         )
-        item = Round(green=Event(start, "review" if uncertain else "auto", reason))
+        item = Round(
+            green=Event(start, "review" if uncertain else "auto", reason), last_green_frame=end - 1
+        )
         if len(candidates) == 2:
             item.blink1 = Event(candidates[0], "auto", "第一次亮到暗")
             item.blink2 = Event(candidates[1], "auto", "第二次亮到暗")
