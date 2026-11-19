@@ -11,7 +11,7 @@ import pytest
 from pcts_video_tool.analysis import analyze
 from pcts_video_tool.detection import TextColorTracker
 from pcts_video_tool.exporting import export_report
-from pcts_video_tool.models import Session, TouchCalibration, normalize_roi
+from pcts_video_tool.models import Event, Round, Session, TouchCalibration, normalize_roi
 from pcts_video_tool.run_logs import export_diagnostics
 from pcts_video_tool.video import inspect_video, read_frame
 
@@ -88,6 +88,7 @@ def test_full_pipeline_uses_local_models_and_exports_evidence(
     assert recorded["round_candidates"][0]["blink1"] == 20
     assert recorded["round_candidates"][0]["coarse_green"] == 60
     assert recorded["round_candidates"][0]["green"] == 50
+    assert result.rounds[0].green_recommendation is None
     assert recorded["coarse_green_segments"][0][0] == 60
     assert recorded["green_segments"][0][0] == 50
     assert recorded["green_refinements"][0]["confirmed_at"] == 55
@@ -303,3 +304,59 @@ def test_calibrated_press_pipeline_works_without_hand_model_and_keeps_post_frame
             "analysis/touch-detection.json",
             "analysis/touch-signals.csv",
         }.issubset(archive.namelist())
+
+
+def test_earlier_green_is_optional_and_confirmed_round_survives_reanalysis(
+    generated_video, monkeypatch
+):
+    from pcts_video_tool import analysis
+
+    path, rois = generated_video
+    detect = analysis.detect_rounds
+
+    def late_but_accepted(*args):
+        found = delayed_first_green(detect)(*args)
+        found.rounds[0].green.state = "auto"
+        return found
+
+    monkeypatch.setattr(analysis, "detect_rounds", late_but_accepted)
+    monkeypatch.setattr(analysis, "create_ocr", lambda: None)
+    monkeypatch.setattr(analysis, "create_hand_detector", lambda **kwargs: None)
+    manual = Event(151, "manual", "已逐帧确认")
+    previous = Round(blink1=Event(121), blink2=Event(141), green=manual)
+    result = analyze(
+        Session(
+            inspect_video(str(path)),
+            rois,
+            [previous],
+            range_mode="manual",
+            test_start=0,
+            test_end=199,
+            range_confirmed=True,
+        )
+    )
+    first, second = result.rounds
+    assert first.green.frame == 60 and first.green.state == "auto"
+    assert first.green_recommendation.frame == 50
+    assert first.green_recommendation.original == first.green
+    assert second.green == manual and second.green_recommendation is None
+    report = json.loads((Path(result.diagnostic_dir) / "detection.json").read_text())
+    assert report["round_candidates"][0]["recommended_green"] == 50
+    assert report["round_candidates"][0]["green"] == 60
+    assert report["green_recommendation_pass"]["frames_checked"] < 25
+
+    # A dropped, manually entered round must never be reassigned to a different blink pair.
+    session = Session(
+        result.video,
+        rois,
+        [previous, Round(green=Event(155, "manual"))],
+        range_mode="manual",
+        test_start=0,
+        test_end=199,
+        range_confirmed=True,
+        diagnostic_dir=result.diagnostic_dir,
+    )
+    with pytest.raises(ValueError, match="已保留原任务"):
+        analyze(session)
+    assert [r.green.frame for r in session.rounds] == [151, 155]
+    assert session.diagnostic_dir == result.diagnostic_dir

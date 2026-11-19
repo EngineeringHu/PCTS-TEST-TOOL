@@ -17,8 +17,9 @@ import cv2
 
 from . import __version__
 from .detection import FeatureExtractor, TextColorTracker, detect_rounds, refine_green_start
+from .green_recommendation import MIN_LEAD_FRAMES, GreenOnsetProbe, interior_glyph
 from .marker import TestWindow, find_test_window
-from .models import Event, Session, check_source, save_session
+from .models import Event, GreenRecommendation, Session, check_source, save_session
 from .motion import locate_motion_press, motion_preview, prepare_motion_tracker
 from .recognition import (
     MAX_READING_RETRIES,
@@ -43,6 +44,7 @@ def analyze(
     percentage(0)
     directory = log_directory() / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     directory.mkdir(parents=True)
+    previous_directory = session.diagnostic_dir
     session.diagnostic_dir = str(directory)
     save_session(session, directory / "input.session.json")
     (directory / "status.json").write_text(
@@ -58,6 +60,13 @@ def analyze(
         report(f"开始分析 v{__version__}；诊断目录：{directory}")
         try:
             result = _analyze(session, report, cancelled, directory, percentage)
+            confirmed = {r.green.frame for r in session.rounds if r.green.state == "manual"}
+            retained = {r.green.frame for r in result.rounds if r.green.state == "manual"}
+            if confirmed - retained:
+                session.diagnostic_dir = previous_directory
+                raise ValueError(
+                    "本次轮次与已人工确认的 green 无法逐轮对应，已保留原任务。可重新导入原片建立独立分析。"
+                )
         except Exception as error:
             (directory / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
             (directory / "status.json").write_text(
@@ -209,6 +218,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     progress(f"有效测试帧：{window.start}～{window.end}；区间外画面不参与轮次识别")
     # Keep original indices; prefix placeholders are outside the analyzed interval.
     lights, greens, blacks = [0.0] * window.start, [0.0] * window.start, [0.0] * window.start
+    black_poses = []
     extract = FeatureExtractor(result.video.width, result.video.height, result.rois)
     reference_frame = min(
         (
@@ -261,6 +271,7 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                 lights.append(light)
                 greens.append(green)
                 blacks.append(black)
+                black_poses.append((*bm["position"], bm["scale"]))
                 signals.writerow(
                     [
                         index,
@@ -304,7 +315,38 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     detection_fps = sampling_fps(result.video)
     ocr_at = {}
     windows = []
+    probes = {}
+    earlier_greens = {}
+    glyph = interior_glyph(tracker.glyph)
+    manual_greens = {}
     for r, (item, end) in enumerate(zip(result.rounds, detected.green_ends)):
+        blink = item.blink2.frame
+        next_start = (
+            result.rounds[r + 1].blink1.frame if r + 1 < len(result.rounds) else window.end + 1
+        )
+        # Match by original video time, including when the user also corrected a blink.
+        previous = [
+            old
+            for old in session.rounds
+            if old.green.state == "manual"
+            and old.green.frame is not None
+            and item.blink1.frame <= old.green.frame < next_start
+        ]
+        if len(previous) == 1:
+            manual_greens[r] = previous[0]
+        if (
+            blink is not None
+            and blink >= window.start + 2
+            and item.green.frame - blink > MIN_LEAD_FRAMES
+            and r not in manual_greens
+        ):
+            anchor = max(
+                range(max(window.start, blink - 9), blink + 1),
+                key=lambda i: blacks[i] - greens[i],
+            )
+            probes[r] = GreenOnsetProbe(
+                glyph, black_poses[anchor - window.start], blink, item.green.frame
+            )
         if item.green.frame is not None:
             start = item.green.frame
             # Read only inside this green segment; never borrow a following round's values.
@@ -362,6 +404,8 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
     readings = [[] for _ in result.rounds]
     touch_samples = [[] for _ in result.rounds]
     touch_decisions = []
+    probe_seconds = 0.0
+    probe_frames = extra_display_frames = 0
     with (
         (directory / "ocr-checks.jsonl").open("w", encoding="utf-8") as reading_log,
         (directory / "touch-signals.csv").open("w", encoding="utf-8", newline="") as touch_log,
@@ -423,9 +467,28 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
                     for start, end, r in windows
                     if start <= i <= end and (contact or r in motion_trackers)
                 ]
-                if not active and (not ocr or i not in ocr_at):
+                probing = [
+                    (r, probe) for r, probe in probes.items() if probe.start <= i <= probe.stop
+                ]
+                only_probes = not active and (not ocr or i not in ocr_at)
+                if only_probes and not probing:
                     continue
+                if only_probes:
+                    extra_display_frames += 1
+                    probe_started = perf_counter()
                 image = display_image(frame)
+                if probing:
+                    if not only_probes:
+                        probe_started = perf_counter()
+                    search = crop(image, tracker.search_roi)
+                    for r, probe in probing:
+                        probe.observe(i, search)
+                        if i == probe.stop:
+                            if probe.candidate is not None:
+                                earlier_greens[r] = probe.candidate
+                            del probes[r]
+                    probe_frames += 1
+                    probe_seconds += perf_counter() - probe_started
                 if ocr and i in ocr_at:
                     reading = read_numbers(ocr, crop(image, result.rois["reading"]))
                     for r in ocr_at[i]:
@@ -605,9 +668,36 @@ def _analyze(session: Session, progress, cancelled, directory: Path, percentage)
             refinements.append({"round": r + 1, **refinement})
             detected.diagnostics["round_candidates"][r]["coarse_green"] = coarse
             detected.diagnostics["round_candidates"][r]["green"] = item.green.frame
+            saved = manual_greens.get(r)
+            if saved is not None:
+                item.green = copy.copy(saved.green)
+                detected.diagnostics["round_candidates"][r]["retained_manual_green"] = (
+                    item.green.frame
+                )
+                if (
+                    saved.green_recommendation
+                    and item.blink2.frame is not None
+                    and item.blink2.frame < item.green.frame
+                ):
+                    item.green_recommendation = copy.deepcopy(saved.green_recommendation)
+            elif r in earlier_greens:
+                earlier = earlier_greens[r]
+                if item.green.frame - earlier >= MIN_LEAD_FRAMES:
+                    item.green_recommendation = GreenRecommendation(earlier, copy.copy(item.green))
+                    detected.diagnostics["round_candidates"][r]["recommended_green"] = earlier
             record({"kind": "result", **refinement})
             percentage(95 + 4 * (r + 1) // len(result.rounds))
     detected.diagnostics["green_refinements"] = refinements
+    detected.diagnostics["green_recommendation_pass"] = {
+        "min_lead_frames": MIN_LEAD_FRAMES,
+        "frames_checked": probe_frames,
+        "extra_display_frames": extra_display_frames,
+        "probe_seconds": round(probe_seconds, 3),
+    }
+    progress(
+        f"green推荐检查：{probe_frames}帧，其中额外转图{extra_display_frames}帧，"
+        f"笔画检查与额外转图共{probe_seconds:.2f}秒"
+    )
     (directory / "detection.json").write_text(
         json.dumps(detected.diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
     )

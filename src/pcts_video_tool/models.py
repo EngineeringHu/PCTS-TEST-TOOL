@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 EVENTS = ("press", "blink1", "blink2", "green")
-SESSION_FORMAT = 7
+SESSION_FORMAT = 8
 METRICS = {
     "end_to_end": "端到端",
     "hu_input": "HU input",
@@ -40,6 +40,12 @@ class Event:
 
 
 @dataclass
+class GreenRecommendation:
+    frame: int
+    original: Event
+
+
+@dataclass
 class TouchCalibration:
     frame: int
     line: list[float]
@@ -62,6 +68,7 @@ class Round:
     # Inclusive end of the detected green segment, used for manual navigation.
     last_green_frame: int | None = None
     reading_states: dict[str, str] = field(default_factory=dict)
+    green_recommendation: GreenRecommendation | None = None
 
     def set_reading_state(self, name: str, state: str) -> None:
         self.reading_states = {
@@ -195,7 +202,24 @@ def load_session(path: Path) -> Session:
             if event.state not in ("auto", "manual", "review"):
                 raise ValueError("未知事件状态")
             events[name] = event
+        recommendation = raw.pop("green_recommendation", None)
         item = Round(**events, **raw)
+        if recommendation is not None:
+            frame = recommendation["frame"]
+            original = Event(**recommendation["original"])
+            if (
+                type(frame) is not int
+                or type(original.frame) is not int
+                or item.blink2.frame is None
+                or not item.blink2.frame < frame < original.frame < len(video.times)
+                or original.state not in ("auto", "review")
+                or not isinstance(original.reason, str)
+            ):
+                raise ValueError("green推荐帧与本轮原值或灭灯帧不一致")
+            expected = frame if item.green.state == "manual" else original.frame
+            if item.green.frame != expected:
+                raise ValueError("green推荐信息与当前测量帧不一致")
+            item.green_recommendation = GreenRecommendation(frame, original)
         if item.last_green_frame is not None and (
             type(item.last_green_frame) is not int
             or not 0 <= item.last_green_frame < len(video.times)

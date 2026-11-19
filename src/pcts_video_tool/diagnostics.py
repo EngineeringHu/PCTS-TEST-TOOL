@@ -27,7 +27,7 @@ def self_test(output: str) -> int:
         from .analysis import analyze
         from .detection import TextColorTracker, refine_green_start
         from .exporting import export_report
-        from .models import Event, Round, Session, TouchCalibration
+        from .models import Event, GreenRecommendation, Round, Session, TouchCalibration
         from .motion import MotionTracker, automatic_finger_samples, locate_motion_press
         from .recognition import create_hand_detector, create_ocr, fingertip, read_numbers
         from .run_logs import export_diagnostics
@@ -232,7 +232,7 @@ def self_test(output: str) -> int:
             with av.open(str(selection_video), "w") as container:
                 stream = container.add_stream("ffv1", rate=240)
                 stream.width, stream.height, stream.pix_fmt = 650, 240, "bgr0"
-                for i in range(6):
+                for i in range(12):
                     picture = np.full((240, 650, 3), 240, np.uint8)
                     cv2.putText(
                         picture,
@@ -317,6 +317,21 @@ def self_test(output: str) -> int:
             item = selection.rounds[0]
             if item.md != -1.2 or item.reading_states != {"md": "manual", "tx": "review"}:
                 raise ValueError("单项读数编辑与独立确认自检失败")
+            original = Event(10, "auto", "原始green")
+            item.blink2 = Event(2, "auto")
+            item.green = original
+            item.green_recommendation = GreenRecommendation(3, original)
+            window.refresh_table()
+            window.preview_green.click()
+            if window.current_frame != 3 or item.green != original:
+                raise ValueError("查看green推荐帧时测量值或浏览帧异常")
+            window.apply_green.click()
+            if item.green.frame != 3 or item.green.state != "manual":
+                raise ValueError("采用green推荐帧失败")
+            window.apply_green.click()
+            if item.green != original:
+                raise ValueError("恢复green原值与状态失败")
+            report["checks"].append("green推荐：查看、明确采用和恢复原帧及确认状态")
             window.dirty = False
             window.close()
             report["checks"].append("单元格复核：状态配色、右键确认当前帧、MD/TX独立编辑与确认")

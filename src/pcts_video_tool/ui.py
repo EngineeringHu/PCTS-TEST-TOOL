@@ -576,6 +576,17 @@ class MainWindow(QMainWindow):
             choose.clicked.connect(lambda checked=False, n=name: self.select_current(n))
             row.addWidget(choose)
             fields.addRow(name, row)
+        self.green_options = QWidget()
+        options = QHBoxLayout(self.green_options)
+        options.setContentsMargins(0, 0, 0, 0)
+        self.preview_green = QPushButton()
+        self.preview_green.clicked.connect(self.preview_recommended_green)
+        self.apply_green = QPushButton()
+        self.apply_green.clicked.connect(self.apply_or_restore_green)
+        options.addWidget(self.preview_green)
+        options.addWidget(self.apply_green)
+        fields.addRow(self.green_options)
+        self.green_options.hide()
         self.md, self.tx = QLineEdit(), QLineEdit()
         self.md.setPlaceholderText("毫秒，可留空")
         self.tx.setPlaceholderText("毫秒，可为负数")
@@ -860,6 +871,16 @@ class MainWindow(QMainWindow):
                         f"press未识别：从blink 1前20帧（原片第{start}帧）开始人工查找；"
                         "仅浏览，未写入press。"
                     )
+            if (
+                self.comparison_field == "green"
+                and item.green_recommendation
+                and item.green.state != "manual"
+            ):
+                recommended = item.green_recommendation.frame
+                hint = (
+                    f"当前 green 为第{item.green.frame}帧，推荐第{recommended}帧"
+                    f"（提前{item.green.frame - recommended}帧）。第二次灭灯后至少两个文字分区的笔画持续变绿。"
+                )
             self.review_hint.setText(hint)
             self.review_hint.setVisible(bool(hint))
         if three_frames:
@@ -927,7 +948,7 @@ class MainWindow(QMainWindow):
         self.shape_combo.setEnabled(not three_frames)
         self.show_frame(self.current_frame)
 
-    def review_event(self, name):
+    def review_event(self, name, *, preview_frame=None):
         row = self.table.currentRow()
         if self.session is None or not 0 <= row < len(self.session.rounds):
             return
@@ -941,6 +962,8 @@ class MainWindow(QMainWindow):
         frame = item.reading_frame if name == "reading" else getattr(item, name).frame
         if name == "press" and frame is None and item.blink1.frame is not None:
             frame = max(0, item.blink1.frame - 20)
+        if preview_frame is not None:
+            frame = preview_frame
         self.show_frame(frame if frame is not None else -1)
 
     def slider_changed(self, value):
@@ -1094,6 +1117,14 @@ class MainWindow(QMainWindow):
                     cell.setData(
                         Qt.UserRole, ("缺失需填写" if value is None else label) + "\n" + reason
                     )
+                    if j == 4 and item.green_recommendation and state != "manual":
+                        recommended = item.green_recommendation.frame
+                        cell.setText(f"{value} · 荐{recommended}")
+                        cell.setData(
+                            Qt.UserRole,
+                            cell.data(Qt.UserRole)
+                            + f"\n笔画变色推荐第{recommended}帧，选中本轮可查看或采用。",
+                        )
                 elif item.problems():
                     cell.setForeground(QColor("#9a5300"))
                 self.table.setItem(i, j, cell)
@@ -1101,6 +1132,7 @@ class MainWindow(QMainWindow):
         if 0 <= selected < len(self.session.rounds):
             self.table.setCurrentCell(selected, max(0, selected_column))
         self.table.blockSignals(False)
+        self.update_green_options()
         if not self.session.rounds and self.comparison_field is not None:
             self.return_full_view()
         metadata = rate_summary(self.session.video, self.session.fps)
@@ -1148,6 +1180,7 @@ class MainWindow(QMainWindow):
         self.editing = True
         item = self.session.rounds[index]
         self.round_title.setText(f"第 {index + 1} 轮 · 修改后点击确认")
+        self.update_green_options()
         for name, spin in self.event_inputs.items():
             frame = getattr(item, name).frame
             spin.setValue(frame if frame is not None else -1)
@@ -1175,13 +1208,53 @@ class MainWindow(QMainWindow):
         index = self.table.currentRow()
         if self.editing or self.session is None or not 0 <= index < len(self.session.rounds):
             return
-        event = getattr(self.session.rounds[index], name)
+        item = self.session.rounds[index]
+        if name in ("green", "blink2"):
+            item.green_recommendation = None
+        event = getattr(item, name)
         event.frame = value if value >= 0 else None
         event.state, event.reason = "review", "人工修改，待确认"
         self.dirty = True
         self.refresh_table()
         if self.comparison_field == "press" and name in ("press", "blink1"):
             self.show_frame(self.current_frame)
+        elif self.comparison_field == "green" and name in ("green", "blink2"):
+            self.review_hint.hide()
+
+    def update_green_options(self):
+        row = self.table.currentRow()
+        item = (
+            self.session.rounds[row]
+            if self.session and 0 <= row < len(self.session.rounds)
+            else None
+        )
+        rec = item.green_recommendation if item else None
+        self.green_options.setVisible(rec is not None)
+        if rec is not None:
+            adopted = item.green.state == "manual"
+            self.preview_green.setVisible(not adopted)
+            self.preview_green.setText(f"查看推荐帧 {rec.frame}")
+            self.apply_green.setText(
+                f"恢复原值 {rec.original.frame}" if adopted else f"采用推荐帧 {rec.frame}"
+            )
+
+    def preview_recommended_green(self):
+        item = self.session.rounds[self.table.currentRow()]
+        self.review_event("green", preview_frame=item.green_recommendation.frame)
+
+    def apply_or_restore_green(self):
+        item = self.session.rounds[self.table.currentRow()]
+        rec = item.green_recommendation
+        if item.green.state == "manual":
+            item.green = copy.copy(rec.original)
+        else:
+            item.green = Event(
+                rec.frame, "manual", f"人工采用笔画变色推荐帧，原值为{rec.original.frame}"
+            )
+        self.dirty = True
+        self.refresh_table()
+        self.select_round(navigate=False)
+        self.review_event("green")
 
     def edit_number(self, name, text, *, strict=False):
         index = self.table.currentRow()
@@ -1256,6 +1329,14 @@ class MainWindow(QMainWindow):
             if frame < 0:
                 return
             event = getattr(item, EVENTS[column - 1])
+            if (
+                column == 4
+                and item.green_recommendation
+                and frame != item.green_recommendation.frame
+            ):
+                item.green_recommendation = None
+            if column == 3 and frame != event.frame:
+                item.green_recommendation = None
             event.frame, event.state, event.reason = frame, "manual", "人工确认当前帧"
         else:
             name = "md" if column == 5 else "tx"
@@ -1327,6 +1408,12 @@ class MainWindow(QMainWindow):
             self.error(f"输入无效：{error}")
             return
         item = self.session.rounds[index]
+        if (
+            item.green.state != "manual"
+            or item.green.frame != frames[3]
+            or item.blink2.frame != frames[2]
+        ):
+            item.green_recommendation = None
         for name, frame in zip(EVENTS, frames):
             event = getattr(item, name)
             event.frame = frame if frame >= 0 else None

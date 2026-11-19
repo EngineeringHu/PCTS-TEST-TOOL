@@ -153,3 +153,44 @@ def test_toggling_hints_does_not_change_confirmed_readings(window):
     window.missing_hints_button.setChecked(True)
     assert window.session.rounds == before and not window.dirty
     assert color(window, 0, 5) == CELL_COLORS["accepted"]
+
+
+def test_green_recommendation_preview_adoption_restore_and_export(window, tmp_path):
+    from pcts_video_tool.exporting import export_report
+    from pcts_video_tool.models import GreenRecommendation, calculate
+
+    session = window.session
+    first = session.rounds[0]
+    first.blink2.frame = 35
+    first.green_recommendation = GreenRecommendation(42, deepcopy(first.green))
+    session.rounds.append(deepcopy(first))
+    session.rounds[1].green_recommendation = None
+    window.refresh_table()
+    original = deepcopy(first)
+    metrics = calculate(session, first)
+    window.dirty = False
+    QTest.mouseClick(window.preview_green, Qt.LeftButton)
+    assert window.current_frame == 42 and window.comparison.frame_indices == [41, 42, 43]
+    assert window.event_inputs["green"].value() == 50 and "提前8帧" in window.review_hint.text()
+    window.step(1)
+    window.table.setCurrentCell(1, 4)
+    assert not window.green_options.isVisible()
+    window.table.setCurrentCell(0, 4)
+    assert first == original and not window.dirty
+    assert color(window, 0, 4) == CELL_COLORS["accepted"]
+    output = export_report(session, tmp_path / "preview", evidence=False)
+    report = json.loads((output.parent / "results.json").read_text())
+    assert report["session"]["rounds"][0]["green"]["frame"] == 50
+    assert calculate(session, first) == metrics
+    QTest.mouseClick(window.apply_green, Qt.LeftButton)
+    assert first.green.frame == 42 and first.green.state == "manual" and window.dirty
+    assert calculate(session, first)["end_to_end"] < metrics["end_to_end"]
+    task = tmp_path / "adopted.json"
+    save_session(session, task)
+    window.accept_session(load_session(task))
+    assert "恢复原值 50" in window.apply_green.text() and not window.preview_green.isVisible()
+    QTest.mouseClick(window.apply_green, Qt.LeftButton)
+    assert window.session.rounds[0] == original
+    window.confirm_cell(0, 4, 50)
+    assert window.session.rounds[0].green_recommendation is None
+    assert not window.green_options.isVisible()
