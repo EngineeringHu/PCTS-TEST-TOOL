@@ -7,7 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
-from PySide6.QtCore import QPointF, QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QImage,
@@ -28,6 +37,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -72,8 +82,8 @@ from .region_frames import prepare_region_session
 from .run_logs import export_diagnostics, log_directory, logger
 from .touch import ContactTracker
 from .video import FrameReader, crop, rate_summary, read_frame
+from .workflow_guide import REGIONS, DetectionGuide, guide_stage
 
-REGIONS = {"flash": "灯光区域", "green": "变绿文字", "reading": "MD / TX", "touch": "触摸观察区域"}
 PRESS_MODES = {
     "auto": "指腹设置：自动",
     "sample": "指腹设置：单点",
@@ -430,15 +440,23 @@ class MainWindow(QMainWindow):
         title = QLabel("PCTS  /  VIDEO MEASUREMENT")
         title.setStyleSheet("font-size:20px; font-weight:700; color:#17324d; padding:8px")
         bar.addWidget(title)
+        self.guide_button = QPushButton("操作指引")
+        self.guide_button.clicked.connect(self.show_workflow_guide)
+        self.guide_button.setStyleSheet("""
+            QPushButton { background:#157347; color:white; border:1px solid #11633d;
+                          border-radius:5px; padding:6px 16px; font-size:14px; font-weight:700; }
+            QPushButton:hover { background:#10623c; }
+            QPushButton:pressed { background:#0b4c2f; }
+        """)
+        bar.addWidget(self.guide_button)
         bar.addStretch()
-        self.buttons = []
+        self.buttons = [self.guide_button]
         for label, callback in (
             ("导入视频", self.open_video),
             ("打开任务", self.open_task),
             ("保存任务", self.save_task),
             ("导出 Excel + 证据", self.export),
             ("导出诊断包", self.export_debug),
-            ("检测说明", self.show_analysis_notes),
             ("有效片段", self.configure_range),
             ("指腹设置：自动", self.configure_touch),
         ):
@@ -448,6 +466,16 @@ class MainWindow(QMainWindow):
             self.buttons.append(button)
             if label == "指腹设置：自动":
                 self.calibration_button = button
+        effect = QGraphicsOpacityEffect(self.guide_button)
+        self.guide_button.setGraphicsEffect(effect)
+        self.guide_pulse = QPropertyAnimation(effect, b"opacity", self)
+        self.guide_pulse.setDuration(3200)
+        self.guide_pulse.setStartValue(1.0)
+        self.guide_pulse.setKeyValueAt(0.5, 0.66)
+        self.guide_pulse.setEndValue(1.0)
+        self.guide_pulse.setEasingCurve(QEasingCurve.InOutSine)
+        self.guide_pulse.setLoopCount(-1)
+        self.reminder_stage = None
         layout.addLayout(bar)
         self.metadata = QLabel("本地分析 · 原片逐帧编号 · 预期10轮 · 两种计时方式")
         self.metadata.setWordWrap(True)
@@ -490,8 +518,19 @@ class MainWindow(QMainWindow):
             button = QPushButton(label)
             button.clicked.connect(lambda checked=False, d=delta: self.step(d))
             navigation.addWidget(button)
-        navigation.addWidget(QLabel("原片帧号"))
+        frame_label = QLabel("原片帧号")
+        frame_label.setStyleSheet("font-size:15px; font-weight:700; color:#104f60")
+        navigation.addWidget(frame_label)
         self.frame_input = QSpinBox()
+        frame_label.setBuddy(self.frame_input)
+        self.frame_input.setAccessibleName("原片帧号")
+        self.frame_input.setMinimumWidth(112)
+        self.frame_input.setAlignment(Qt.AlignCenter)
+        self.frame_input.setStyleSheet("""
+            QSpinBox { background-color: #e9f7fa; color: #104f60; font-size: 22px; font-weight: 700; }
+            QSpinBox QLineEdit { color: #104f60;
+                                 padding: 0; font-size: 22px; font-weight: 700; }
+        """)
         self.frame_input.setRange(-1, 0)
         self.frame_input.setSpecialValueText("未指定")
         self.frame_input.setValue(-1)
@@ -698,11 +737,25 @@ class MainWindow(QMainWindow):
             QProgressBar::chunk { background: #69b6c9; border-radius: 3px; }
         """)
 
+        self.update_guide_reminder()
+
+    def update_guide_reminder(self):
+        stage = guide_stage(self.session)
+        if stage != self.reminder_stage:
+            self.reminder_stage = stage
+            self.guide_pulse.start()
+        if not self.root.isEnabled() and self.guide_pulse.state() == QPropertyAnimation.Running:
+            self.guide_pulse.pause()
+            self.guide_button.graphicsEffect().setOpacity(1.0)
+        elif self.root.isEnabled() and self.guide_pulse.state() == QPropertyAnimation.Paused:
+            self.guide_pulse.resume()
+
     def begin(self, function, completed, *, measure_analysis=False):
         if self.worker and self.worker.isRunning():
             return
         self.seek_timer.stop()
         self.root.setEnabled(False)
+        self.update_guide_reminder()
         self.cancel_button.setEnabled(True)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("正在处理")
@@ -744,6 +797,7 @@ class MainWindow(QMainWindow):
     def work_finished(self):
         self.root.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self.update_guide_reminder()
 
     def cancel_work(self):
         if self.worker:
@@ -781,6 +835,7 @@ class MainWindow(QMainWindow):
             )
 
     def accept_session(self, session: Session, previews=None, *, saved=False):
+        self.reminder_stage = None
         self.editing = True
         self.return_full_view()
         self.region_combo.setCurrentIndex(0)
@@ -1048,7 +1103,7 @@ class MainWindow(QMainWindow):
     def accept_analysis(self, session):
         self.accept_session(session, self.region_previews)
         if not session.rounds:
-            message = "分析已结束，但未识别到有效轮次。请查看检测说明，或导出诊断包。"
+            message = "分析已结束，但未识别到有效轮次。请查看“操作指引”中的检测记录，或导出诊断包。"
             self.round_title.setText("未识别到轮次 · 检测原因如下")
             self.details.setPlainText("\n\n".join(session.analysis_notes + session.video.warnings))
             self.statusBar().showMessage(message)
@@ -1148,6 +1203,7 @@ class MainWindow(QMainWindow):
         if totals:
             text += f" · 端到端均值 {sum(totals) / len(totals):.2f} ms（有值{len(totals)}轮）"
         self.summary.setText(text)
+        self.update_guide_reminder()
 
     def update_missing_hints(self):
         enabled = self.missing_hints_button.isChecked()
@@ -1828,13 +1884,29 @@ class MainWindow(QMainWindow):
         self.refresh_table()
         self.statusBar().showMessage("有效片段设置已更新；范围变化后请重新分析")
 
-    def show_analysis_notes(self):
-        text = (
-            "\n\n".join(self.session.analysis_notes + self.session.video.warnings)
-            if self.session
-            else "尚未分析"
-        )
-        QMessageBox.information(self, "检测说明", text + f"\n\n诊断日志位置：{log_directory()}")
+    def show_workflow_guide(self):
+        stage = guide_stage(self.session)
+        self.guide_pulse.stop()
+        self.guide_button.graphicsEffect().setOpacity(1.0)
+        dialog = DetectionGuide(self.session, CELL_COLORS, self)
+        accepted = dialog.exec() == QDialog.Accepted
+        dialog.deleteLater()
+        if not accepted:
+            return
+        if stage == "import":
+            self.open_video()
+        elif stage in ("regions", "empty"):
+            key = (
+                "green"
+                if stage == "empty"
+                else next(k for k in REGIONS if k not in self.session.rois)
+            )
+            if self.region_combo.currentData() == key:
+                self.select_region()
+            else:
+                self.region_combo.setCurrentIndex(self.region_combo.findData(key))
+        elif stage == "ready":
+            self.start_analysis()
 
     def export_debug(self):
         path, _ = QFileDialog.getSaveFileName(

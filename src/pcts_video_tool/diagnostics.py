@@ -172,11 +172,13 @@ def self_test(output: str) -> int:
                 raise ValueError("诊断记录缺少分析用时")
             report["checks"].append("诊断：失败运行自动记录，日志与任务可导出ZIP")
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-            from PySide6.QtCore import Qt, QTimer
+            from PySide6.QtCore import Qt, QTimer, QUrl
+            from PySide6.QtGui import QImage, QPixmap, QTextDocument
             from PySide6.QtTest import QTest
-            from PySide6.QtWidgets import QApplication
+            from PySide6.QtWidgets import QApplication, QTabWidget
 
-            from .ui import MainWindow
+            from .ui import CELL_COLORS, MainWindow
+            from .workflow_guide import EXAMPLES, REGIONS, DetectionGuide
 
             app = QApplication.instance() or QApplication([])
             report["qt_platform"] = app.platformName()
@@ -270,6 +272,23 @@ def self_test(output: str) -> int:
             report["checks"].append("辅助选帧：导入时识别文字与读数，缓存原片画面")
             window = MainWindow()
             window.accept_session(selection, previews)
+            for task, keys, height in (
+                (None, ("steady-camera", "fixed-tap"), 176),
+                (selection, REGIONS, 270),
+            ):
+                guide = DetectionGuide(task, CELL_COLORS, window)
+                document = guide.findChild(QTabWidget).currentWidget().document()
+                for key in keys:
+                    url = QUrl.fromLocalFile(str(EXAMPLES / f"{key}.png"))
+                    picture = document.resource(QTextDocument.ImageResource, url)
+                    if (
+                        url.toString() not in document.toHtml()
+                        or not isinstance(picture, (QImage, QPixmap))
+                        or (picture.width(), picture.height()) != (560, height)
+                    ):
+                        raise ValueError(f"操作指引缺少可显示的示例图：{key}")
+                guide.close()
+            report["checks"].append("操作指引：两张拍摄示意图与四张框选参考图均可离线显示")
             window.dirty = False
             # Supply a frame to exercise the touch selection control without inventing a hand.
             window.region_previews["touch"] = previews["flash"]
@@ -293,8 +312,6 @@ def self_test(output: str) -> int:
             window.table.setCurrentCell(0, 1)
             window.show_frame(2)
             app.processEvents()
-            from .ui import CELL_COLORS
-
             if (
                 window.table.item(0, 1).background().color().name() != CELL_COLORS["review"]
                 or window.table.item(0, 2).background().color().name() != CELL_COLORS["accepted"]
